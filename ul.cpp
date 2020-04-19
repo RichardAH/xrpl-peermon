@@ -28,6 +28,7 @@
 
 #define DEBUG 1
 
+
 template<class... Args>
 int printd(Args ... args)
 {
@@ -68,7 +69,7 @@ int connect_peer(std::string_view ip_port) {
 }
 
 
-int generate_node_keys(unsigned char* outsec32, unsigned char* outpubraw64, unsigned char* outpubcompressed33, char* outnodekeyb58, size_t* outnodekeyb58size) {
+int generate_node_keys(secp256k1_context* ctx, unsigned char* outsec32, unsigned char* outpubraw64, unsigned char* outpubcompressed33, char* outnodekeyb58, size_t* outnodekeyb58size) {
     
     // create secp256k1 context and randomize it
 
@@ -79,9 +80,6 @@ int generate_node_keys(unsigned char* outsec32, unsigned char* outpubraw64, unsi
         exit(1);
     }
 
-    secp256k1_context* ctx = secp256k1_context_create(
-                SECP256K1_CONTEXT_VERIFY |
-                SECP256K1_CONTEXT_SIGN) ;
 
 
     unsigned char seed[32];
@@ -120,7 +118,6 @@ int generate_node_keys(unsigned char* outsec32, unsigned char* outpubraw64, unsi
 
     // clean up
     close(rndfd);
-    secp256k1_context_destroy(ctx);
 
     // pub key must start with magic type 0x1C
     outpubcompressed38[0] = 0x1C;
@@ -151,16 +148,75 @@ int main() {
         exit(6);
     }
 
+    
+    secp256k1_context* secp256k1ctx = secp256k1_context_create(
+                SECP256K1_CONTEXT_VERIFY |
+                SECP256K1_CONTEXT_SIGN) ;
+
+
+
+
+
+    int fd = -1;
+
+    for (auto& v: peers) {
+        std::cout << v << "\n";
+        std::cout << "socketfd: " << (fd = connect_peer(v)) << "\n";
+        break;
+    }
+
+
     SSL_library_init();
 
+    const SSL_METHOD *method = TLS_client_method(); /* Create new client-method instance */
+    SSL_CTX *ctx = SSL_CTX_new(method);
+
+    SSL* ssl = SSL_new(ctx);
+    SSL_set_fd(ssl, fd); 
+
+    int status = SSL_connect(ssl);
+    if ( status != 1 ) {
+        fprintf(stderr, "[FATAL] SSL_connect failed with SSL_get_error code %d\n", status);
+        exit(10);
+    }    
+
+    printf("Connected with %s encryption\n", SSL_get_cipher(ssl));
+   // const char *chars = "Hello World, 123!";
+   // SSL_write(ssl, chars, strlen(chars));
+
+    unsigned char buffer[1024];
+    size_t len = SSL_get_finished(ssl, buffer, 1024);
+    if (len < 12) {
+        fprintf(stderr, "[FATAL] Could not SSL_get_finished\n");
+        exit(11);
+    }
+
+    // SHA512 SSL_get_finished to create cookie 1
+    unsigned char cookie1[64];
+    crypto_hash_sha512(cookie1, buffer, len);
+    
+    len = SSL_get_peer_finished(ssl, buffer, 1024);
+    if (len < 12) {
+        fprintf(stderr, "[FATAL] Could not SSL_get_peer_finished\n");
+        exit(12);
+    }   
+   
+    // SHA512 SSL_get_peer_finished to create cookie 2
+    unsigned char cookie2[64];
+    crypto_hash_sha512(cookie2, buffer, len);
+
+    // xor cookie2 onto cookie1
+    for (int i = 0; i < 64; ++i) cookie1[i] ^= cookie2[i];
+
+    // the first half of cookie2 is the true cookie
+    crypto_hash_sha512(cookie2, cookie1, 64);
 
     // generate keys
-
 
     unsigned char sec[32], pub[64], pubc[33];
     char b58[100];
     size_t b58size = 100;
-    generate_node_keys(sec, pub, pubc, b58, &b58size);
+    generate_node_keys(secp256k1ctx, sec, pub, pubc, b58, &b58size);
     printf("size: %lu\n", b58size);
 
     printf("seckey: ");
@@ -173,18 +229,50 @@ int main() {
     printf("base58: %s\n", b58); 
 
 
-/*
-    int fd = -1;
+    secp256k1_ecdsa_signature sig;
+    secp256k1_ecdsa_sign(secp256k1ctx, &sig, cookie2, sec, NULL, NULL);
+   
 
-    for (auto& v: peers) {
-        std::cout << v << "\n";
-        std::cout << "socketfd: " << (fd = connect_peer(v)) << "\n";
-        break;
+    unsigned char buf[200];
+    size_t buflen = 200;
+    secp256k1_ecdsa_signature_serialize_der(secp256k1ctx, buf, &buflen, &sig);
+
+ 
+    printf("signature len=%d: ", buflen);
+    for (int i = 0; i < buflen; ++i)
+        printf("%02X", buf[i]);
+    printf("\n");    
+
+
+    char buf2[200];
+    size_t buflen2 = 200;
+    sodium_bin2base64(buf2, buflen2, buf, buflen, sodium_base64_VARIANT_ORIGINAL);
+
+    buf2[buflen2] = '\0';
+    printf("base64: %s\n", buf2);
+
+
+    char buf3[2048];
+    size_t buf3len = snprintf(buf3, 2047, "GET / HTTP/1.1\r\nUser-Agent: rippled-1.6.0\r\nUpgrade: RTXP/1.2\r\nConnection: Upgrade\r\nConnect-As: Peer\r\nCrawl: private\r\nSession-Signature: %s\r\nPublic-Key: %s\r\n\r\n", buf2, b58);
+
+    printf("To write:\n%s", buf3);
+
+    if (SSL_write(ssl, buf3, buf3len) <= 0) {
+        fprintf(stderr, "[FATAL] Failed to write bytes to openssl fd\n");
+        return 11;
     }
-*/
-
     
+   
 
+    buf3len = SSL_read(ssl, buf3, 2048); 
+    buf3[buf3len] = '\0';
+    printf("returned:\n%s", buf3);
+
+
+    secp256k1_context_destroy(secp256k1ctx);
+    SSL_free(ssl);
+    close(fd);
+    SSL_CTX_free(ctx);
 
     return 0;
 }
