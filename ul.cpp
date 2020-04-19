@@ -140,36 +140,13 @@ int generate_node_keys(secp256k1_context* ctx, unsigned char* outsec32, unsigned
 
 }
 
-int main() {
+//todo: clean up and optimise, check for overrun 
+SSL* ssl_handshake_and_upgrade(secp256k1_context* secp256k1ctx, int fd, SSL_CTX** outctx) {
 
-
-    if (sodium_init() < 0) {
-        fprintf(stderr, "[FATAL] Could not init libsodium\n");
-        exit(6);
-    }
-
-    
-    secp256k1_context* secp256k1ctx = secp256k1_context_create(
-                SECP256K1_CONTEXT_VERIFY |
-                SECP256K1_CONTEXT_SIGN) ;
-
-
-
-
-
-    int fd = -1;
-
-    for (auto& v: peers) {
-        std::cout << v << "\n";
-        std::cout << "socketfd: " << (fd = connect_peer(v)) << "\n";
-        break;
-    }
-
-
-    SSL_library_init();
-
-    const SSL_METHOD *method = TLS_client_method(); /* Create new client-method instance */
+    const SSL_METHOD *method = TLS_client_method(); 
     SSL_CTX *ctx = SSL_CTX_new(method);
+
+    *outctx = ctx;
 
     SSL* ssl = SSL_new(ctx);
     SSL_set_fd(ssl, fd); 
@@ -177,18 +154,14 @@ int main() {
     int status = SSL_connect(ssl);
     if ( status != 1 ) {
         fprintf(stderr, "[FATAL] SSL_connect failed with SSL_get_error code %d\n", status);
-        exit(10);
+        return NULL;
     }    
-
-    printf("Connected with %s encryption\n", SSL_get_cipher(ssl));
-   // const char *chars = "Hello World, 123!";
-   // SSL_write(ssl, chars, strlen(chars));
 
     unsigned char buffer[1024];
     size_t len = SSL_get_finished(ssl, buffer, 1024);
     if (len < 12) {
         fprintf(stderr, "[FATAL] Could not SSL_get_finished\n");
-        exit(11);
+        return NULL;
     }
 
     // SHA512 SSL_get_finished to create cookie 1
@@ -198,7 +171,7 @@ int main() {
     len = SSL_get_peer_finished(ssl, buffer, 1024);
     if (len < 12) {
         fprintf(stderr, "[FATAL] Could not SSL_get_peer_finished\n");
-        exit(12);
+        return NULL;
     }   
    
     // SHA512 SSL_get_peer_finished to create cookie 2
@@ -217,32 +190,13 @@ int main() {
     char b58[100];
     size_t b58size = 100;
     generate_node_keys(secp256k1ctx, sec, pub, pubc, b58, &b58size);
-    printf("size: %lu\n", b58size);
-
-    printf("seckey: ");
-    for (int i = 0; i < 32; ++i)
-        printf("%02X", sec[i]);
-    printf("\npubkey: ");
-    for (int i = 0; i < 33; ++i)
-        printf("%02X", pub[i]);
-    printf("\n");
-    printf("base58: %s\n", b58); 
-
 
     secp256k1_ecdsa_signature sig;
     secp256k1_ecdsa_sign(secp256k1ctx, &sig, cookie2, sec, NULL, NULL);
    
-
     unsigned char buf[200];
     size_t buflen = 200;
     secp256k1_ecdsa_signature_serialize_der(secp256k1ctx, buf, &buflen, &sig);
-
- 
-    printf("signature len=%d: ", buflen);
-    for (int i = 0; i < buflen; ++i)
-        printf("%02X", buf[i]);
-    printf("\n");    
-
 
     char buf2[200];
     size_t buflen2 = 200;
@@ -259,20 +213,80 @@ int main() {
 
     if (SSL_write(ssl, buf3, buf3len) <= 0) {
         fprintf(stderr, "[FATAL] Failed to write bytes to openssl fd\n");
-        return 11;
+        return NULL;
     }
+
+    return ssl;
+
+}
+
+int main() {
+
+
+    if (sodium_init() < 0) {
+        fprintf(stderr, "[FATAL] Could not init libsodium\n");
+        exit(6);
+    }
+
+    SSL_library_init();
     
-   
+    secp256k1_context* secp256k1ctx = secp256k1_context_create(
+                SECP256K1_CONTEXT_VERIFY |
+                SECP256K1_CONTEXT_SIGN) ;
 
-    buf3len = SSL_read(ssl, buf3, 2048); 
-    buf3[buf3len] = '\0';
-    printf("returned:\n%s", buf3);
 
+    int fd = -1;
+
+    /*for (auto& v: peers) {
+        std::cout << v << "\n";
+        std::cout << "socketfd: " << (fd = connect_peer(v)) << "\n";
+        break;
+    }*/
+    fd = connect_peer("35.158.96.209:51235");
+
+
+    if (fd <= 0) {
+        fprintf(stderr, "[FATAL] Could not connect\n"); // todo just return
+        exit(11);
+    }
+
+    SSL_CTX* sslctx = NULL;
+
+    SSL* ssl = ssl_handshake_and_upgrade(secp256k1ctx, fd, &sslctx);
+
+    if (ssl == NULL) {
+        fprintf(stderr, "[FATAL] Could not handshake\n");
+        exit(12);
+    }
+ 
+
+ 
+    unsigned char buffer[2048];
+    size_t bufferlen = 2048;
+
+ 
+    int pc = 0;
+    while (1) {
+        bufferlen = SSL_read(ssl, buffer, 2048); 
+        buffer[bufferlen] = '\0';
+        if (!pc) {
+            printf("returned:\n%s", buffer);
+            pc++;
+            continue;
+        }
+        
+        printf("packet %d:\n", pc++);
+        for (int i = 0; i < bufferlen; ++i)
+            printf("%02X", buffer[i]);
+
+        printf("\n");
+        
+    }
 
     secp256k1_context_destroy(secp256k1ctx);
     SSL_free(ssl);
+    SSL_CTX_free(sslctx);
     close(fd);
-    SSL_CTX_free(ctx);
 
     return 0;
 }
