@@ -23,11 +23,13 @@
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 
+#include <stdint.h>
+
 #include "peers.h"
 #include "ripple.pb.h"
 
 #define DEBUG 1
-
+#define PACKET_STACK_BUFFER_SIZE 2048
 
 template<class... Args>
 int printd(Args ... args)
@@ -220,6 +222,85 @@ SSL* ssl_handshake_and_upgrade(secp256k1_context* secp256k1ctx, int fd, SSL_CTX*
 
 }
 
+
+const char* packet_name(int packet_type) {
+    switch(packet_type) {
+        case 2:
+            return "mtMANIFESTS";
+        case 3:
+            return "mtPING";
+        case 5:
+            return "mtCLUSTER";
+        case 15:
+            return "mtENDPOINTS";
+        case 30:
+            return "mtTRANSACTION";
+        case 31:
+            return "mtGET_LEDGER";
+        case 32:
+            return "mtLEDGER_DATA";
+        case 33:
+            return "mtPROPOSE_LEDGER";
+        case 34:
+            return "mtSTATUS_CHANGE";
+        case 35:
+            return "mtHAVE_SET";
+        case 41:
+            return "mtVALIDATION";
+        case 42:
+            return "mtGET_OBJECTS";
+        case 50:
+            return "mtGET_SHARD_INFO";
+        case 51:
+            return "mtSHARD_INFO";
+        case 52:
+            return "mtGET_PEER_SHARD_INFO";
+        case 53:
+            return "mtPEER_SHARD_INFO";
+        case 54:
+            return "mtVALIDATORLIST";
+        default:
+            return "unknown";
+    }
+}
+
+
+void process_packet(SSL* ssl, int packet_type, unsigned char* packet_buffer, size_t packet_len) {
+
+    
+    printf("packet %s size %lu:\n", packet_name(packet_type), packet_len);
+
+    // mtPING
+    if ( packet_type == 3 ) {
+        protocol::TMPing ping;
+        bool success = ping.ParseFromArray( packet_buffer, packet_len ) ;
+        printf("parsed ping: %s\n", (success ? "yes" : "no") );
+        ping.set_type(protocol::TMPing_pingType_ptPONG);
+
+
+        //unsigned char* buf = (unsigned char*) malloc(ping.ByteSizeLong());
+        ping.SerializeToArray(packet_buffer, packet_len);
+
+        uint32_t reply_len = packet_len;
+        uint16_t reply_type = 3;
+
+        // write reply header
+        unsigned char header[6];
+        header[0] = (reply_len >> 24) & 0xff;
+        header[1] = (reply_len >> 16) & 0xff;
+        header[2] = (reply_len >> 8) & 0xff;
+        header[3] = reply_len & 0xff;
+        header[4] = (reply_type >> 8) & 0xff;
+        header[5] = reply_type & 0xff;
+        SSL_write(ssl, header, 6);
+        SSL_write(ssl, packet_buffer, packet_len);
+        
+        printf("Sent PONG\n");
+
+    }
+
+}
+
 int main() {
 
 
@@ -261,23 +342,50 @@ int main() {
  
 
  
-    unsigned char buffer[2048];
-    size_t bufferlen = 2048;
+    unsigned char buffer[PACKET_STACK_BUFFER_SIZE];
+    size_t bufferlen = PACKET_STACK_BUFFER_SIZE;
 
  
     int pc = 0;
     while (1) {
-        bufferlen = SSL_read(ssl, buffer, 2048); 
+        bufferlen = SSL_read(ssl, buffer, PACKET_STACK_BUFFER_SIZE); 
         buffer[bufferlen] = '\0';
         if (!pc) {
             printf("returned:\n%s", buffer);
             pc++;
             continue;
         }
+
+
+        // check header version
+        if (buffer[0] >> 2 != 0) {
+            fprintf(stderr, "[FATAL] Peer sent packets we don't understand\n");
+            exit(13);
+        }
+
+        // first 4 bytes are bigendian payload size
+        uint32_t payload_size = (buffer[0] << 24) + (buffer[1] << 16) + (buffer[2] << 8) + buffer[3];
+        uint16_t packet_type = (buffer[4] << 8) + buffer[5];
+
+
+        // the vast majority of packets will fit in the stack buffer, but for those which do not, we will read the rest into heap
+        if (payload_size + 6 > bufferlen) {
+            // incomplete packet, receive the rest into a heap buffer
+            size_t bufferlen2 = payload_size;
+            unsigned char* heapbuf = (unsigned char*) malloc( bufferlen2 );
+            bufferlen2 = SSL_read(ssl, heapbuf + bufferlen, bufferlen2);
+
+            for (size_t i = 0; i < bufferlen; ++i) heapbuf[i] = buffer[i + 6];
+
+            process_packet( ssl, packet_type, heapbuf, payload_size );
+            free(heapbuf);
+        }
+
+        process_packet( ssl, packet_type, buffer+6, bufferlen-6 );
+
         
-        printf("packet %d:\n", pc++);
-        for (int i = 0; i < bufferlen; ++i)
-            printf("%02X", buffer[i]);
+//        for (int i = 0; i < bufferlen; ++i)
+//            printf("%02X", buffer[i]);
 
         printf("\n");
         
