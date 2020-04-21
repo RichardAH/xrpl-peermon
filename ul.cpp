@@ -28,6 +28,8 @@
 #include "peers.h"
 #include "ripple.pb.h"
 
+#include "stlookup.h"
+
 #define DEBUG 1
 #define PACKET_STACK_BUFFER_SIZE 2048
 
@@ -271,32 +273,48 @@ void process_packet(SSL* ssl, int packet_type, unsigned char* packet_buffer, siz
     printf("packet %s size %lu:\n", packet_name(packet_type), packet_len);
 
     // mtPING
-    if ( packet_type == 3 ) {
-        protocol::TMPing ping;
-        bool success = ping.ParseFromArray( packet_buffer, packet_len ) ;
-        printf("parsed ping: %s\n", (success ? "yes" : "no") );
-        ping.set_type(protocol::TMPing_pingType_ptPONG);
+    switch (packet_type) {
 
+        case 3: {
+            protocol::TMPing ping;
+            bool success = ping.ParseFromArray( packet_buffer, packet_len ) ;
+            printf("parsed ping: %s\n", (success ? "yes" : "no") );
+            ping.set_type(protocol::TMPing_pingType_ptPONG);
 
-        //unsigned char* buf = (unsigned char*) malloc(ping.ByteSizeLong());
-        ping.SerializeToArray(packet_buffer, packet_len);
+            //unsigned char* buf = (unsigned char*) malloc(ping.ByteSizeLong());
+            ping.SerializeToArray(packet_buffer, packet_len);
 
-        uint32_t reply_len = packet_len;
-        uint16_t reply_type = 3;
+            uint32_t reply_len = packet_len;
+            uint16_t reply_type = 3;
 
-        // write reply header
-        unsigned char header[6];
-        header[0] = (reply_len >> 24) & 0xff;
-        header[1] = (reply_len >> 16) & 0xff;
-        header[2] = (reply_len >> 8) & 0xff;
-        header[3] = reply_len & 0xff;
-        header[4] = (reply_type >> 8) & 0xff;
-        header[5] = reply_type & 0xff;
-        SSL_write(ssl, header, 6);
-        SSL_write(ssl, packet_buffer, packet_len);
+            // write reply header
+            unsigned char header[6];
+            header[0] = (reply_len >> 24) & 0xff;
+            header[1] = (reply_len >> 16) & 0xff;
+            header[2] = (reply_len >> 8) & 0xff;
+            header[3] = reply_len & 0xff;
+            header[4] = (reply_type >> 8) & 0xff;
+            header[5] = reply_type & 0xff;
+            SSL_write(ssl, header, 6);
+            SSL_write(ssl, packet_buffer, packet_len);
+            
+            printf("Sent PONG\n");
+            return;
+        }
+
+        case 41:  { //mtVALIDATION
+            protocol::TMValidation validation;
+            bool success = validation.ParseFromArray( packet_buffer, packet_len );
+            printf("parsed validation: %s\n", (success ? "yes" : "no") );
+            const std::string& stvalidation = validation.validation();
+            printf("stvalidation data: ");
+            for (unsigned char c : stvalidation)
+                printf("%02X", c);
+            printf("\n");
+        }
+//        default:
+//            break;
         
-        printf("Sent PONG\n");
-
     }
 
 }
