@@ -1,3 +1,5 @@
+#define PEER "35.158.96.209:51235"
+
 #include <sodium.h>
 
 #include <iostream>
@@ -25,13 +27,18 @@
 
 #include <stdint.h>
 
+#include <set>
+
 #include "peers.h"
 #include "ripple.pb.h"
 
 #include "stlookup.h"
 
+#include "sha-256.h"
+#include "xd.h"
 #define DEBUG 1
 #define PACKET_STACK_BUFFER_SIZE 2048
+
 
 template<class... Args>
 int printd(Args ... args)
@@ -40,7 +47,8 @@ int printd(Args ... args)
     return 1;
 }
 
-int connect_peer(std::string_view ip_port) {
+int connect_peer(std::string_view ip_port)
+{
 
     auto x = ip_port.find_last_of(":");
     if (x == std::string_view::npos)
@@ -73,18 +81,22 @@ int connect_peer(std::string_view ip_port) {
 }
 
 
-int generate_node_keys(secp256k1_context* ctx, unsigned char* outsec32, unsigned char* outpubraw64, unsigned char* outpubcompressed33, char* outnodekeyb58, size_t* outnodekeyb58size) {
+int generate_node_keys(
+        secp256k1_context* ctx,
+        unsigned char* outsec32,
+        unsigned char* outpubraw64,
+        unsigned char* outpubcompressed33,
+        char* outnodekeyb58,
+        size_t* outnodekeyb58size)
+{
     
     // create secp256k1 context and randomize it
-
     int rndfd = open("/dev/urandom", O_RDONLY);
 
     if (rndfd < 0) {
         fprintf(stderr, "[FATAL] Could not open /dev/urandom for reading\n");
         exit(1);
     }
-
-
 
     unsigned char seed[32];
     auto result = read(rndfd, seed, 32);
@@ -145,8 +157,8 @@ int generate_node_keys(secp256k1_context* ctx, unsigned char* outsec32, unsigned
 }
 
 //todo: clean up and optimise, check for overrun 
-SSL* ssl_handshake_and_upgrade(secp256k1_context* secp256k1ctx, int fd, SSL_CTX** outctx) {
-
+SSL* ssl_handshake_and_upgrade(secp256k1_context* secp256k1ctx, int fd, SSL_CTX** outctx)
+{
     const SSL_METHOD *method = TLS_client_method(); 
     SSL_CTX *ctx = SSL_CTX_new(method);
 
@@ -221,61 +233,69 @@ SSL* ssl_handshake_and_upgrade(secp256k1_context* secp256k1ctx, int fd, SSL_CTX*
     }
 
     return ssl;
-
 }
 
+const char* mtUNKNOWN = "mtUNKNOWN_PACKET";
 
-const char* packet_name(int packet_type) {
-    switch(packet_type) {
-        case 2:
-            return "mtMANIFESTS";
-        case 3:
-            return "mtPING";
-        case 5:
-            return "mtCLUSTER";
-        case 15:
-            return "mtENDPOINTS";
-        case 30:
-            return "mtTRANSACTION";
-        case 31:
-            return "mtGET_LEDGER";
-        case 32:
-            return "mtLEDGER_DATA";
-        case 33:
-            return "mtPROPOSE_LEDGER";
-        case 34:
-            return "mtSTATUS_CHANGE";
-        case 35:
-            return "mtHAVE_SET";
-        case 41:
-            return "mtVALIDATION";
-        case 42:
-            return "mtGET_OBJECTS";
-        case 50:
-            return "mtGET_SHARD_INFO";
-        case 51:
-            return "mtSHARD_INFO";
-        case 52:
-            return "mtGET_PEER_SHARD_INFO";
-        case 53:
-            return "mtPEER_SHARD_INFO";
-        case 54:
-            return "mtVALIDATORLIST";
-        default:
-            return "unknown";
+const char* packet_name(
+        int packet_type)
+{
+    switch(packet_type)
+    {
+        case 2: return "mtMANIFESTS";
+        case 3: return "mtPING";
+        case 5: return "mtCLUSTER";
+        case 15: return "mtENDPOINTS";
+        case 30: return "mtTRANSACTION";
+        case 31: return "mtGET_LEDGER";
+        case 32: return "mtLEDGER_DATA";
+        case 33: return "mtPROPOSE_LEDGER";
+        case 34: return "mtSTATUS_CHANGE";
+        case 35: return "mtHAVE_SET";
+        case 41: return "mtVALIDATION";
+        case 42: return "mtGET_OBJECTS";
+        case 50: return "mtGET_SHARD_INFO";
+        case 51: return "mtSHARD_INFO";
+        case 52: return "mtGET_PEER_SHARD_INFO";
+        case 53: return "mtPEER_SHARD_INFO";
+        case 54: return "mtVALIDATORLIST";
+        case 55: return "mtSQUELCH";
+        case 56: return "mtVALIDATORLISTCOLLECTION";
+        case 57: return "mtPROOF_PATH_REQ";
+        case 58: return "mtPROOF_PATH_RESPONSE";
+        case 59: return "mtREPLAY_DELTA_REQ";
+        case 60: return "mtREPLAY_DELTA_RESPONSE";
+        case 61: return "mtGET_PEER_SHARD_INFO_V2";
+        case 62: return "mtPEER_SHARD_INFO_V2";
+        case 63: return "mtHAVE_TRANSACTIONS";
+        case 64: return "mtTRANSACTIONS";        
+        default: return mtUNKNOWN;
     }
 }
 
+std::set<int> suppressions;
 
-void process_packet(SSL* ssl, int packet_type, unsigned char* packet_buffer, size_t packet_len) {
+void process_packet(
+        SSL* ssl,
+        int packet_type,
+        unsigned char* packet_buffer,
+        size_t packet_len)
+{
 
-    
-    printf("packet %s size %lu:\n", packet_name(packet_type), packet_len);
+    if (suppressions.find(packet_type) != suppressions.end())
+        return;
 
-    // mtPING
-    switch (packet_type) {
+    printf("packet %s [%d] size %lu:\n", packet_name(packet_type), packet_type, packet_len);
 
-        case 3: {
+
+    switch (packet_type)
+    {
+        case 2: // mtMANIFESTS
+        {
+            break;
+        }
+        case 3: // mtPING
+        {
             protocol::TMPing ping;
             bool success = ping.ParseFromArray( packet_buffer, packet_len ) ;
             printf("parsed ping: %s\n", (success ? "yes" : "no") );
@@ -301,8 +321,55 @@ void process_packet(SSL* ssl, int packet_type, unsigned char* packet_buffer, siz
             printf("Sent PONG\n");
             return;
         }
+        case 5: // mtCLUSTER
+        {
+            break;
+        }
+        case 15: // mtENDPOINTS
+        {
+            break;
+        }
+        case 30: // mtTRANSACTION
+        {   //rawTransaction
+            protocol::TMTransaction txn;
+            bool success = txn.ParseFromArray( packet_buffer, packet_len );
+            printf("parsed transaction: %s\n", (success ? "yes" : "no") );
+            const std::string& st = txn.rawtransaction();
+            printf("sttransaction data: ");
+            for (unsigned char c : st)
+                printf("%02X", c);
 
-        case 41:  { //mtVALIDATION
+            printf("\n");
+            uint8_t* output = 0;
+            if (!deserialize(&output, st.c_str(), st.size(), 0, 0, 0))
+                return fprintf(stderr, "Could not deserialize\n");
+            printf("%s\n", output);
+            free(output);
+            break;
+            break;
+        }
+        case 31: // mtGET_LEDGER
+        {
+            break;
+        }
+        case 32: // mtLEDGER_DATA
+        {
+            break;
+        }
+        case 33: // mtPROPOSE_LEDGER
+        {
+            break;
+        }
+        case 34: // mtSTATUS_CHANGE
+        {
+            break;
+        }
+        case 35: // mtHAVE_SET
+        {
+            break;
+        }
+        case 41: // mtVALIDATION
+        {
             protocol::TMValidation validation;
             bool success = validation.ParseFromArray( packet_buffer, packet_len );
             printf("parsed validation: %s\n", (success ? "yes" : "no") );
@@ -310,18 +377,106 @@ void process_packet(SSL* ssl, int packet_type, unsigned char* packet_buffer, siz
             printf("stvalidation data: ");
             for (unsigned char c : stvalidation)
                 printf("%02X", c);
-            printf("\n");
-        }
-//        default:
-//            break;
-        
-    }
 
+            printf("\n");
+            uint8_t* output = 0;
+            if (!deserialize(&output, stvalidation.c_str(), stvalidation.size(), 0, 0, 0))
+                return fprintf(stderr, "Could not deserialize\n");
+            printf("%s\n", output);
+            free(output);
+            break;
+        }
+        case 42: // mtGET_OBJECTS
+        {
+            break;
+        }
+        case 50: // mtGET_SHARD_INFO
+        {
+            break;
+        }
+        case 51: // mtSHARD_INFO
+        {
+            break;
+        }
+        case 52: // mtGET_PEER_SHARD_INFO
+        {
+            break;
+        }
+        case 53: // mtPEER_SHARD_INFO
+        {
+            break;
+        }
+        case 54: // mtVALIDATORLIST
+        {
+            break;
+        }
+        case 55: // mtSQUELCH
+        {
+            break;
+        }
+        case 56: // mtVALIDATORLISTCOLLECTION
+        {
+            break;
+        }
+        case 57: // mtPROOF_PATH_REQ
+        {
+            break;
+        }
+        case 58: // mtPROOF_PATH_RESPONSE
+        {
+            break;
+        }
+        case 59: // mtREPLAY_DELTA_REQ
+        {
+            break;
+        }
+        case 60: // mtREPLAY_DELTA_RESPONSE
+        {
+            break;
+        }
+        case 61: // mtGET_PEER_SHARD_INFO_V2
+        {
+            break;
+        }
+        case 62: // mtPEER_SHARD_INFO_V2
+        {
+            break;
+        }
+        case 63: // mtHAVE_TRANSACTIONS
+        {
+            break;
+        }
+        case 64: // mtTRANSACTIONS
+        {
+            break;
+        }
+        default:
+        {
+            printf(
+                "==== unknown contents ===[\n");
+            for (int i = 0; i < packet_len && i < 64; ++i)
+                printf("%02X", packet_buffer[i]);
+            printf("\n"
+                "]===(may be truncated)====\n");
+        }
+    }
 }
 
-int main() {
+int main(int argc, char** argv)
+{
 
 
+    //suppressions.emplace(3);
+    //suppressions.emplace(30);
+    //suppressions.emplace(41);
+
+    std::cout << "Suppressing: \n";
+    for (int x : suppressions)
+        std::cout << "\t" << packet_name(x) << "\n";
+
+    std::cout << "\n";
+
+    b58_sha256_impl = calc_sha_256; 
     if (sodium_init() < 0) {
         fprintf(stderr, "[FATAL] Could not init libsodium\n");
         exit(6);
@@ -336,13 +491,7 @@ int main() {
 
     int fd = -1;
 
-    /*for (auto& v: peers) {
-        std::cout << v << "\n";
-        std::cout << "socketfd: " << (fd = connect_peer(v)) << "\n";
-        break;
-    }*/
-    fd = connect_peer("35.158.96.209:51235");
-
+    fd = connect_peer(PEER);
 
     if (fd <= 0) {
         fprintf(stderr, "[FATAL] Could not connect\n"); // todo just return
@@ -358,12 +507,9 @@ int main() {
         exit(12);
     }
  
-
- 
     unsigned char buffer[PACKET_STACK_BUFFER_SIZE];
     size_t bufferlen = PACKET_STACK_BUFFER_SIZE;
 
- 
     int pc = 0;
     while (1) {
         bufferlen = SSL_read(ssl, buffer, PACKET_STACK_BUFFER_SIZE); 
@@ -376,10 +522,10 @@ int main() {
 
 
         // check header version
-        if (buffer[0] >> 2 != 0) {
-            fprintf(stderr, "[FATAL] Peer sent packets we don't understand\n");
-            exit(13);
-        }
+//        if (buffer[0] >> 2 != 0) {
+//            fprintf(stderr, "[FATAL] Peer sent packets we don't understand\n");
+//            exit(13);
+//        }
 
         // first 4 bytes are bigendian payload size
         uint32_t payload_size = (buffer[0] << 24) + (buffer[1] << 16) + (buffer[2] << 8) + buffer[3];
@@ -400,12 +546,6 @@ int main() {
         }
 
         process_packet( ssl, packet_type, buffer+6, bufferlen-6 );
-
-        
-//        for (int i = 0; i < bufferlen; ++i)
-//            printf("%02X", buffer[i]);
-
-        printf("\n");
         
     }
 
