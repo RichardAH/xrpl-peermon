@@ -19,7 +19,7 @@
 #include <stdlib.h>
 #include <unistd.h>
 
-#include <libbase58.h>
+#include "libbase58.h"
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 
@@ -211,7 +211,7 @@ SSL* ssl_handshake_and_upgrade(secp256k1_context* secp256k1ctx, int fd, SSL_CTX*
 
 
     char buf3[2048];
-    size_t buf3len = snprintf(buf3, 2047, "GET / HTTP/1.1\r\nUser-Agent: rippled-1.6.0\r\nUpgrade: RTXP/1.2\r\nConnection: Upgrade\r\nConnect-As: Peer\r\nCrawl: private\r\nSession-Signature: %s\r\nPublic-Key: %s\r\n\r\n", buf2, b58);
+    size_t buf3len = snprintf(buf3, 2047, "GET / HTTP/1.1\r\nUser-Agent: rippled-1.8.0\r\nUpgrade: RTXP/1.2\r\nConnection: Upgrade\r\nConnect-As: Peer\r\nCrawl: private\r\nSession-Signature: %s\r\nPublic-Key: %s\r\n\r\n", buf2, b58);
 
     printf("To write:\n%s", buf3);
 
