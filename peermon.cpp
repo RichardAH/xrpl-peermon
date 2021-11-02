@@ -314,7 +314,7 @@ void human_readable(uint64_t bytes, char* output, char* end)
 
 #define PAD 20
 
-int use_cls = 1;
+int use_cls = 1, no_dump = 0;
 
 void process_packet(
         SSL* ssl,
@@ -415,6 +415,8 @@ void process_packet(
 
     printf("Latest packet: %s [%d] -- %lu bytes\n", packet_name(packet_type, 0), packet_type, packet_len);
 
+    if (no_dump)
+        return;
 
     switch (packet_type)
     {
@@ -597,7 +599,10 @@ int print_usage(int argc, char** argv, char* message)
         fprintf(stderr, "Error: %s\n", message);
     else
         fprintf(stderr, "A tool to connect to a rippled node as a peer and monitor the traffic it produces\n");
-    fprintf(stderr, "Usage: %s PEER-IP PORT [no-cls]\n", argv[0]);
+    fprintf(stderr, "Usage: %s PEER-IP PORT [OPTIONS]\n", argv[0]);
+    fprintf(stderr, "Options:\n"
+            "\tno-cls\t- Don't clear the screen between printing stats.\n"
+            "\tno-dump\t- Don't dump the latest packet contents.\n");
     fprintf(stderr, "Example: %s r.ripple.com 51235\n", argv[0]);
     return 1;
 }
@@ -605,7 +610,7 @@ int print_usage(int argc, char** argv, char* message)
 int main(int argc, char** argv)
 {
 
-    if (argc != 3 && argc != 4)
+    if (argc < 3)
         return print_usage(argc, argv, NULL);
 
     int port = 0;
@@ -631,11 +636,15 @@ int main(int argc, char** argv)
 
     peer = std::string{host} + ":" + std::string{argv[2]};
 
-    if (argc == 4 && strcmp(argv[3], "no-cls") != 0)
-        return print_usage(argc, argv, "Valid options: no-cls");
-
-    if (argc == 4)
-        use_cls = 0;
+    for (int i = 3; i < argc; ++i)
+    {
+        if (strcmp(argv[i], "no-cls") == 0)
+            use_cls = 0;
+        else if (strcmp(argv[i], "no-dump") == 0)
+            no_dump = 1;
+        else
+            return print_usage(argc, argv, "Valid options: no-cls");
+    }
 
     //suppressions.emplace(3);
     //suppressions.emplace(30);
@@ -689,7 +698,7 @@ int main(int argc, char** argv)
         bufferlen = SSL_read(ssl, buffer, PACKET_STACK_BUFFER_SIZE); 
         buffer[bufferlen] = '\0';
         if (!pc) {
-            printf("returned:\n%s", buffer);
+            printf("Returned:\n%s", buffer);
 
             if (bufferlen >= sizeof("HTTP/1.1 503 Service Unavailable")-1 &&
                 memcmp(buffer, "HTTP/1.1 503 Service Unavailable", sizeof("HTTP/1.1 503 Service Unavailable")-1) == 0)
