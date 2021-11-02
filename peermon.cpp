@@ -329,6 +329,17 @@ void process_packet(
 
     if (suppressions.find(packet_type) != suppressions.end())
         return;
+    
+    time_t time_now = time(NULL);
+    int display = (slow ? 0 : 1);
+
+    if (slow && time_now - last_print >= 5)
+    {
+        last_print = time_now;
+        display = 1;
+    }
+
+    
 
     if (counters.find(packet_type) == counters.end())
         counters.emplace(std::pair<int, std::pair<uint64_t, uint64_t>>{packet_type, std::pair<uint64_t, uint64_t>{1,packet_len}});
@@ -339,13 +350,14 @@ void process_packet(
         p.second += packet_len;
     }
 
-    printf("Latest packet: %s [%d] -- %lu bytes\n", packet_name(packet_type, 0), packet_type, packet_len);
+    if (display)
+        printf("Latest packet: %s [%d] -- %lu bytes\n", packet_name(packet_type, 0), packet_type, packet_len);
 
     if (packet_type == 3) //mtPing
     {
         protocol::TMPing ping;
         bool success = ping.ParseFromArray( packet_buffer, packet_len ) ;
-        if (!no_dump)
+        if (!no_dump && display)
          printf("parsed ping: %s\n", (success ? "yes" : "no") );
         ping.set_type(protocol::TMPing_pingType_ptPONG);
 
@@ -366,14 +378,14 @@ void process_packet(
         SSL_write(ssl, header, 6);
         SSL_write(ssl, packet_buffer, packet_len);
 
-        if (!no_dump)        
+        if (!no_dump && display) 
             printf("Sent PONG\n");
         return;
     }
 
 
 
-    if (!no_dump)    
+    if (!no_dump && display)
     switch (packet_type)
     {
         case 2: // mtMANIFESTS
@@ -555,12 +567,8 @@ void process_packet(
     if (use_cls) 
         fprintf(stdout, "%c%c", 033, 'c');
 
-    time_t time_now = time(NULL);
-    if (slow && time_now - last_print < 5)
-        return;
-    last_print = time_now;
-
     // display logic
+    if (display)
     {
         time_t time_elapsed = time_now - time_start;
         if (time_elapsed <= 0) time_elapsed = 1;
@@ -806,16 +814,16 @@ int main(int argc, char** argv)
 
         int header_size = (compressed ? 10 : 6);
 
-        printf("HEADER: %02X%02X%02X%02X %02X%02X %02X%02X%02X%02X\n", buffer[0], buffer[1], buffer[2], buffer[3],
-                buffer[4], buffer[5],
-                buffer[6], buffer[7], buffer[8], buffer[9]);
+//        printf("HEADER: %02X%02X%02X%02X %02X%02X %02X%02X%02X%02X\n", buffer[0], buffer[1], buffer[2], buffer[3],
+//                buffer[4], buffer[5],
+//                buffer[6], buffer[7], buffer[8], buffer[9]);
 
         // the vast majority of packets will fit in the stack buffer, but for those which do not, we will read the rest into heap
         if (payload_size + header_size > bufferlen)
         {
 
-            printf("payload_size[%d] + header_size[%d] = %d, bufferlen = %d\n",
-                    payload_size, header_size, payload_size + header_size, bufferlen); 
+//            printf("payload_size[%d] + header_size[%d] = %d, bufferlen = %d\n",
+//                    payload_size, header_size, payload_size + header_size, bufferlen); 
             // incomplete packet, receive the rest into a heap buffer
             
             size_t total_read = bufferlen - header_size;
@@ -835,11 +843,11 @@ int main(int argc, char** argv)
                     fprintf(stderr, "Error reading / disconnect\n");
                     exit(1);
                 }
-                printf("Large message... read %d bytes of %d...\n", bytes_read, payload_size);
+//                printf("Large message... read %d bytes of %d...\n", bytes_read, payload_size);
                 total_read += bytes_read;
             }
 
-            printf("payload_size: %d  toal_read: %d\n", payload_size, total_read);
+//            printf("payload_size: %d  toal_read: %d\n", payload_size, total_read);
 
             process_packet(
                     ssl, packet_type, heapbuf, payload_size, compressed, uncompressed_size);
