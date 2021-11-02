@@ -7,7 +7,7 @@ Assuming you are on Ubuntu 20+:
 ```
 git clone https://github.com/RichardAH/xrpl-peermon.git
 cd xrpl-peermon
-apt install libsodium-dev libsecp256k1-dev libprotobuf-dev protobuf-compiler
+apt install libsodium-dev libsecp256k1-dev libprotobuf-dev protobuf-compiler libssl-dev -y
 make
 ```
 
@@ -15,7 +15,13 @@ make
 Usage:
 
 ```
-./peermon PEER-IP PORT
+./peermon PEER-IP PORT [OPTIONS]
+Options:
+        no-cls          - Don't clear the screen between printing stats.
+        no-dump         - Don't dump the latest packet contents.
+        slow            - Only print at most once every 5 seconds.
+        manifests-only  - Only collect and print manifests then exit.
+        raw             - Print raw hex where appropriate instead of giving it line numbers and spacing.
 ```
 
 Example:
