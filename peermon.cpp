@@ -1,4 +1,5 @@
 
+#define VERSION "1.1"
 #include <sodium.h>
 
 #include <iostream>
@@ -41,7 +42,6 @@
 #define DEBUG 1
 #define PACKET_STACK_BUFFER_SIZE 2048
 
-#define VERSION "1.0"
 
 std::string peer;
 time_t time_start;
@@ -314,7 +314,7 @@ void human_readable(uint64_t bytes, char* output, char* end)
 
 #define PAD 20
 
-int use_cls = 1, no_dump = 0, slow = 0;
+int use_cls = 1, no_dump = 0, slow = 0, manifests_only = 0, raw_hex = 0;
 time_t last_print = 0;
 
 void process_packet(
@@ -454,10 +454,40 @@ void process_packet(
     if (no_dump)
         return;
 
+
+    if (manifests_only && packet_type != 2)
+    {
+        printf("Quiting due to manifests-only flag\n");
+        exit(0);
+    }
+    
     switch (packet_type)
     {
         case 2: // mtMANIFESTS
         {
+            protocol::TMManifests mans;
+            bool success = mans.ParseFromArray(packet_buffer, packet_len);
+            printf("parsed manifests: %s\n", (success ? "yes" : "no"));
+
+            printf("mtManifests contains %d manifests\n", mans.list_size());
+            for (int i = 0; i < mans.list_size(); ++i)
+            {
+                protocol::TMManifest const& man = mans.list(i);
+                const std::string& sto = man.stobject();
+                printf("Manifest %d is %d bytes:\n", i, sto.size());
+                const unsigned char* x = (const unsigned char*)(sto.c_str());
+                for (int j = 0; j < sto.size(); j++)
+                {
+                    if (j % 16 == 0 && !raw_hex)
+                        printf("0x%08X:\t", j);
+
+                    printf("%02X%s", x[j],  (raw_hex ? "" : 
+                                            (j % 16 == 15 ? "\n" :
+                                            (j % 4 == 3 ? "  " :
+                                            (j % 2 == 1 ? " " : "")))));
+                }
+                printf("\n");
+            }
             break;
         }
         case 5: // mtCLUSTER
@@ -610,9 +640,11 @@ int print_usage(int argc, char** argv, char* message)
         fprintf(stderr, "A tool to connect to a rippled node as a peer and monitor the traffic it produces\n");
     fprintf(stderr, "Usage: %s PEER-IP PORT [OPTIONS]\n", argv[0]);
     fprintf(stderr, "Options:\n"
-            "\tno-cls\t- Don't clear the screen between printing stats.\n"
-            "\tno-dump\t- Don't dump the latest packet contents.\n"
-            "\tslow\t- Only print at most once every 5 seconds.\n");
+            "\tno-cls\t\t- Don't clear the screen between printing stats.\n"
+            "\tno-dump\t\t- Don't dump the latest packet contents.\n"
+            "\tslow\t\t- Only print at most once every 5 seconds.\n"
+            "\tmanifests-only\t- Only collect and print manifests then exit.\n"
+            "\traw\t\t- Print raw hex where appropriate instead of giving it line numbers and spacing.\n");
     fprintf(stderr, "Example: %s r.ripple.com 51235\n", argv[0]);
     return 1;
 }
@@ -659,6 +691,10 @@ int main(int argc, char** argv)
             no_dump = 1;
         else if (strcmp(argv[i], "slow") == 0)
             slow = 1;
+        else if (strcmp(argv[i], "manifests-only") == 0)
+            manifests_only = 1;
+        else if (strcmp(argv[i], "raw") == 0)
+            raw_hex = 1;
         else
             return print_usage(argc, argv, "Valid options: no-cls");
     }
@@ -757,6 +793,8 @@ int main(int argc, char** argv)
 
             process_packet( ssl, packet_type, heapbuf, payload_size );
             free(heapbuf);
+
+            continue;
         }
 
         process_packet( ssl, packet_type, buffer+6, bufferlen-6 );
