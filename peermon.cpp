@@ -1,4 +1,3 @@
-#define PEER "35.158.96.209:51235"
 
 #include <sodium.h>
 
@@ -28,8 +27,9 @@
 #include <stdint.h>
 
 #include <set>
+#include <map>
+#include <utility>
 
-#include "peers.h"
 #include "ripple.pb.h"
 
 #include "stlookup.h"
@@ -39,6 +39,9 @@
 #define DEBUG 1
 #define PACKET_STACK_BUFFER_SIZE 2048
 
+#define VERSION "1.0"
+
+std::string peer;
 
 template<class... Args>
 int printd(Args ... args)
@@ -238,42 +241,44 @@ SSL* ssl_handshake_and_upgrade(secp256k1_context* secp256k1ctx, int fd, SSL_CTX*
 const char* mtUNKNOWN = "mtUNKNOWN_PACKET";
 
 const char* packet_name(
-        int packet_type)
+        int packet_type, int padded)
 {
     switch(packet_type)
     {
-        case 2: return "mtMANIFESTS";
-        case 3: return "mtPING";
-        case 5: return "mtCLUSTER";
-        case 15: return "mtENDPOINTS";
-        case 30: return "mtTRANSACTION";
-        case 31: return "mtGET_LEDGER";
-        case 32: return "mtLEDGER_DATA";
-        case 33: return "mtPROPOSE_LEDGER";
-        case 34: return "mtSTATUS_CHANGE";
-        case 35: return "mtHAVE_SET";
-        case 41: return "mtVALIDATION";
-        case 42: return "mtGET_OBJECTS";
-        case 50: return "mtGET_SHARD_INFO";
-        case 51: return "mtSHARD_INFO";
-        case 52: return "mtGET_PEER_SHARD_INFO";
-        case 53: return "mtPEER_SHARD_INFO";
-        case 54: return "mtVALIDATORLIST";
-        case 55: return "mtSQUELCH";
-        case 56: return "mtVALIDATORLISTCOLLECTION";
-        case 57: return "mtPROOF_PATH_REQ";
-        case 58: return "mtPROOF_PATH_RESPONSE";
-        case 59: return "mtREPLAY_DELTA_REQ";
-        case 60: return "mtREPLAY_DELTA_RESPONSE";
-        case 61: return "mtGET_PEER_SHARD_INFO_V2";
-        case 62: return "mtPEER_SHARD_INFO_V2";
-        case 63: return "mtHAVE_TRANSACTIONS";
-        case 64: return "mtTRANSACTIONS";        
-        default: return mtUNKNOWN;
+        case 2: return (padded ? "mtMANIFESTS               " : "mtMANIFESTS");
+        case 3: return (padded ? "mtPING                    " : "mtPING");
+        case 5: return (padded ? "mtCLUSTER                 " : "mtCLUSTER");
+        case 15: return (padded ? "mtENDPOINTS               " : "mtENDPOINTS");
+        case 30: return (padded ? "mtTRANSACTION             " : "mtTRANSACTION");
+        case 31: return (padded ? "mtGET_LEDGER              " : "mtGET_LEDGER");
+        case 32: return (padded ? "mtLEDGER_DATA             " : "mtLEDGER_DATA");
+        case 33: return (padded ? "mtPROPOSE_LEDGER          " : "mtPROPOSE_LEDGER");
+        case 34: return (padded ? "mtSTATUS_CHANGE           " : "mtSTATUS_CHANGE");
+        case 35: return (padded ? "mtHAVE_SET                " : "mtHAVE_SET");
+        case 41: return (padded ? "mtVALIDATION              " : "mtVALIDATION");
+        case 42: return (padded ? "mtGET_OBJECTS             " : "mtGET_OBJECTS");
+        case 50: return (padded ? "mtGET_SHARD_INFO          " : "mtGET_SHARD_INFO");
+        case 51: return (padded ? "mtSHARD_INFO              " : "mtSHARD_INFO");
+        case 52: return (padded ? "mtGET_PEER_SHARD_INFO     " : "mtGET_PEER_SHARD_INFO");
+        case 53: return (padded ? "mtPEER_SHARD_INFO         " : "mtPEER_SHARD_INFO");
+        case 54: return (padded ? "mtVALIDATORLIST           " : "mtVALIDATORLIST");
+        case 55: return (padded ? "mtSQUELCH                 " : "mtSQUELCH");
+        case 56: return (padded ? "mtVALIDATORLISTCOLLECTION " : "mtVALIDATORLISTCOLLECTION");
+        case 57: return (padded ? "mtPROOF_PATH_REQ          " : "mtPROOF_PATH_REQ");
+        case 58: return (padded ? "mtPROOF_PATH_RESPONSE     " : "mtPROOF_PATH_RESPONSE");
+        case 59: return (padded ? "mtREPLAY_DELTA_REQ        " : "mtREPLAY_DELTA_REQ");
+        case 60: return (padded ? "mtREPLAY_DELTA_RESPONSE   " : "mtREPLAY_DELTA_RESPONSE");
+        case 61: return (padded ? "mtGET_PEER_SHARD_INFO_V2  " : "mtGET_PEER_SHARD_INFO_V2");
+        case 62: return (padded ? "mtPEER_SHARD_INFO_V2      " : "mtPEER_SHARD_INFO_V2");
+        case 63: return (padded ? "mtHAVE_TRANSACTIONS       " : "mtHAVE_TRANSACTIONS");
+        case 64: return (padded ? "mtTRANSACTIONS            " : "mtTRANSACTIONS");        
+        default: return (padded ? "mtUNKNOWN_PACKET          " : mtUNKNOWN);
     }
 }
 
+
 std::set<int> suppressions;
+std::map<int, std::pair<uint64_t, uint64_t>> counters; // packet type => [ packet_count, total_bytes ];
 
 void process_packet(
         SSL* ssl,
@@ -282,10 +287,31 @@ void process_packet(
         size_t packet_len)
 {
 
+    if (counters.find(packet_type) == counters.end())
+        counters.emplace(std::pair<int, std::pair<uint64_t, uint64_t>>{packet_type, std::pair<uint64_t, uint64_t>{1,packet_len}});
+    else
+    {
+        auto& p = counters[packet_type];
+        p.first++;
+        p.second += packet_len;
+    }
+
     if (suppressions.find(packet_type) != suppressions.end())
         return;
+    
+    fprintf(stdout, "%c%c", 033, 'c');
 
-    printf("packet %s [%d] size %lu:\n", packet_name(packet_type), packet_type, packet_len);
+    printf("Peer: %s\nPacket                    Count\t\tTotal Bytes\n", peer.c_str());
+
+    for (int i = 0; i < 128; ++i)
+    if (counters.find(i) != counters.end())
+    {
+        auto& p = counters[i];
+        printf("%s%llu\t\t%llu\n", packet_name(i, 1), p.first, p.second);
+    }
+    printf("\n\n");
+
+    printf("packet %s [%d] size %lu:\n", packet_name(packet_type, 0), packet_type, packet_len);
 
 
     switch (packet_type)
@@ -462,9 +488,29 @@ void process_packet(
     }
 }
 
+int print_usage(int argc, char** argv, char* message)
+{
+    fprintf(stderr, "XRPL Peer Monitor\nVersion: %s\nAuthor: Richard Holland / XRPL-Labs\n", VERSION);
+    if (message)
+        fprintf(stderr, "Error: %s\n", message);
+    else
+        fprintf(stderr, "A tool to connect to a rippled node as a peer and monitor the traffic it produces\n");
+    fprintf(stderr, "Usage: %s PEER-IP PORT\n", argv[0]);
+    return 1;
+}
+
 int main(int argc, char** argv)
 {
 
+    if (argc != 3)
+        return print_usage(argc, argv, NULL);
+
+    int port = 0;
+
+    if (sscanf(argv[2], "%lu", &port) != 1)
+        return print_usage(argc, argv, "Invalid port");
+
+    peer = std::string{argv[1]} + ":" + std::string{argv[2]};
 
     //suppressions.emplace(3);
     //suppressions.emplace(30);
@@ -472,7 +518,7 @@ int main(int argc, char** argv)
 
     std::cout << "Suppressing: \n";
     for (int x : suppressions)
-        std::cout << "\t" << packet_name(x) << "\n";
+        std::cout << "\t" << packet_name(x, 0) << "\n";
 
     std::cout << "\n";
 
@@ -491,7 +537,7 @@ int main(int argc, char** argv)
 
     int fd = -1;
 
-    fd = connect_peer(PEER);
+    fd = connect_peer(peer.c_str());
 
     if (fd <= 0) {
         fprintf(stderr, "[FATAL] Could not connect\n"); // todo just return
