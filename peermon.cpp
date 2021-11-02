@@ -710,6 +710,12 @@ int main(int argc, char** argv)
     int pc = 0;
     while (fd_valid(fd)) {
         bufferlen = SSL_read(ssl, buffer, PACKET_STACK_BUFFER_SIZE); 
+        if (bufferlen == 0)
+        {
+            fprintf(stderr, "Server stopped responding\n");
+            break;
+        }
+
         buffer[bufferlen] = '\0';
         if (!pc) {
             printf("Returned:\n%s", buffer);
