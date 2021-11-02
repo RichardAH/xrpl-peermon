@@ -314,6 +314,8 @@ void human_readable(uint64_t bytes, char* output, char* end)
 
 #define PAD 20
 
+int use_cls = 1;
+
 void process_packet(
         SSL* ssl,
         int packet_type,
@@ -333,8 +335,9 @@ void process_packet(
     if (suppressions.find(packet_type) != suppressions.end())
         return;
 
-    // cls    
-    fprintf(stdout, "%c%c", 033, 'c');
+    // cls   
+    if (use_cls) 
+        fprintf(stdout, "%c%c", 033, 'c');
 
     // display logic
     {
@@ -594,7 +597,7 @@ int print_usage(int argc, char** argv, char* message)
         fprintf(stderr, "Error: %s\n", message);
     else
         fprintf(stderr, "A tool to connect to a rippled node as a peer and monitor the traffic it produces\n");
-    fprintf(stderr, "Usage: %s PEER-IP PORT\n", argv[0]);
+    fprintf(stderr, "Usage: %s PEER-IP PORT [no-cls]\n", argv[0]);
     fprintf(stderr, "Example: %s r.ripple.com 51235\n", argv[0]);
     return 1;
 }
@@ -602,7 +605,7 @@ int print_usage(int argc, char** argv, char* message)
 int main(int argc, char** argv)
 {
 
-    if (argc != 3)
+    if (argc != 3 && argc != 4)
         return print_usage(argc, argv, NULL);
 
     int port = 0;
@@ -625,7 +628,14 @@ int main(int argc, char** argv)
             return print_usage(argc, argv, "Invalid IP after resolving hostname (IPv4 ONLY)");
     }
 
+
     peer = std::string{host} + ":" + std::string{argv[2]};
+
+    if (argc == 4 && strcmp(argv[3], "no-cls") != 0)
+        return print_usage(argc, argv, "Valid options: no-cls");
+
+    if (argc == 4)
+        use_cls = 0;
 
     //suppressions.emplace(3);
     //suppressions.emplace(30);
@@ -680,6 +690,14 @@ int main(int argc, char** argv)
         buffer[bufferlen] = '\0';
         if (!pc) {
             printf("returned:\n%s", buffer);
+
+            if (bufferlen >= sizeof("HTTP/1.1 503 Service Unavailable")-1 &&
+                memcmp(buffer, "HTTP/1.1 503 Service Unavailable", sizeof("HTTP/1.1 503 Service Unavailable")-1) == 0)
+            {
+                fprintf(stderr, "Node reported Service Unavailable\n");
+                return 2;
+            }
+
             pc++;
             continue;
         }
