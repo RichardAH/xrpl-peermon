@@ -314,7 +314,8 @@ void human_readable(uint64_t bytes, char* output, char* end)
 
 #define PAD 20
 
-int use_cls = 1, no_dump = 0;
+int use_cls = 1, no_dump = 0, slow = 0;
+time_t last_print = 0;
 
 void process_packet(
         SSL* ssl,
@@ -339,9 +340,14 @@ void process_packet(
     if (use_cls) 
         fprintf(stdout, "%c%c", 033, 'c');
 
+    time_t time_now = time(NULL);
+    if (slow && time_now - last_print < 5)
+        return;
+    last_print = time_now;
+
     // display logic
     {
-        time_t time_elapsed = time(NULL) - time_start;
+        time_t time_elapsed = time_now - time_start;
         if (time_elapsed <= 0) time_elapsed = 1;
 
         printf(
@@ -602,9 +608,15 @@ int print_usage(int argc, char** argv, char* message)
     fprintf(stderr, "Usage: %s PEER-IP PORT [OPTIONS]\n", argv[0]);
     fprintf(stderr, "Options:\n"
             "\tno-cls\t- Don't clear the screen between printing stats.\n"
-            "\tno-dump\t- Don't dump the latest packet contents.\n");
+            "\tno-dump\t- Don't dump the latest packet contents.\n"
+            "\tslow\t- Only print at most once every 5 seconds.\n");
     fprintf(stderr, "Example: %s r.ripple.com 51235\n", argv[0]);
     return 1;
+}
+
+int fd_valid(int fd)
+{
+    return fcntl(fd, F_GETFD) != -1 || errno != EBADF;
 }
 
 int main(int argc, char** argv)
@@ -642,6 +654,8 @@ int main(int argc, char** argv)
             use_cls = 0;
         else if (strcmp(argv[i], "no-dump") == 0)
             no_dump = 1;
+        else if (strcmp(argv[i], "slow") == 0)
+            slow = 1;
         else
             return print_usage(argc, argv, "Valid options: no-cls");
     }
@@ -694,7 +708,7 @@ int main(int argc, char** argv)
     size_t bufferlen = PACKET_STACK_BUFFER_SIZE;
 
     int pc = 0;
-    while (1) {
+    while (fd_valid(fd)) {
         bufferlen = SSL_read(ssl, buffer, PACKET_STACK_BUFFER_SIZE); 
         buffer[bufferlen] = '\0';
         if (!pc) {
