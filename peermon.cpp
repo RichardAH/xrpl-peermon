@@ -421,6 +421,36 @@ void process_packet(
 
     printf("Latest packet: %s [%d] -- %lu bytes\n", packet_name(packet_type, 0), packet_type, packet_len);
 
+    if (packet_type == 3) //mtPing
+    {
+        protocol::TMPing ping;
+        bool success = ping.ParseFromArray( packet_buffer, packet_len ) ;
+        if (!no_dump)
+         printf("parsed ping: %s\n", (success ? "yes" : "no") );
+        ping.set_type(protocol::TMPing_pingType_ptPONG);
+
+        //unsigned char* buf = (unsigned char*) malloc(ping.ByteSizeLong());
+        ping.SerializeToArray(packet_buffer, packet_len);
+
+        uint32_t reply_len = packet_len;
+        uint16_t reply_type = 3;
+
+        // write reply header
+        unsigned char header[6];
+        header[0] = (reply_len >> 24) & 0xff;
+        header[1] = (reply_len >> 16) & 0xff;
+        header[2] = (reply_len >> 8) & 0xff;
+        header[3] = reply_len & 0xff;
+        header[4] = (reply_type >> 8) & 0xff;
+        header[5] = reply_type & 0xff;
+        SSL_write(ssl, header, 6);
+        SSL_write(ssl, packet_buffer, packet_len);
+
+        if (!no_dump)        
+            printf("Sent PONG\n");
+        return;
+    }
+
     if (no_dump)
         return;
 
@@ -429,33 +459,6 @@ void process_packet(
         case 2: // mtMANIFESTS
         {
             break;
-        }
-        case 3: // mtPING
-        {
-            protocol::TMPing ping;
-            bool success = ping.ParseFromArray( packet_buffer, packet_len ) ;
-            printf("parsed ping: %s\n", (success ? "yes" : "no") );
-            ping.set_type(protocol::TMPing_pingType_ptPONG);
-
-            //unsigned char* buf = (unsigned char*) malloc(ping.ByteSizeLong());
-            ping.SerializeToArray(packet_buffer, packet_len);
-
-            uint32_t reply_len = packet_len;
-            uint16_t reply_type = 3;
-
-            // write reply header
-            unsigned char header[6];
-            header[0] = (reply_len >> 24) & 0xff;
-            header[1] = (reply_len >> 16) & 0xff;
-            header[2] = (reply_len >> 8) & 0xff;
-            header[3] = reply_len & 0xff;
-            header[4] = (reply_type >> 8) & 0xff;
-            header[5] = reply_type & 0xff;
-            SSL_write(ssl, header, 6);
-            SSL_write(ssl, packet_buffer, packet_len);
-            
-            printf("Sent PONG\n");
-            return;
         }
         case 5: // mtCLUSTER
         {
