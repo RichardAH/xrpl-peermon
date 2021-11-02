@@ -5,6 +5,7 @@
 #include <string_view>
 #include <string>
 #include <string.h>
+#include <time.h>
 
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -33,6 +34,7 @@
 #include "ripple.pb.h"
 
 #include "stlookup.h"
+#include  <netdb.h>
 
 #include "sha-256.h"
 #include "xd.h"
@@ -42,6 +44,7 @@
 #define VERSION "1.0"
 
 std::string peer;
+time_t time_start;
 
 template<class... Args>
 int printd(Args ... args)
@@ -277,8 +280,39 @@ const char* packet_name(
 }
 
 
+
+
 std::set<int> suppressions;
 std::map<int, std::pair<uint64_t, uint64_t>> counters; // packet type => [ packet_count, total_bytes ];
+
+
+void rpad(char* output, int padding_chars)
+{
+    int i = strlen(output);
+    while (padding_chars -i > 0)
+        output[i++] = ' ';
+    output[i] = '\0';
+}
+
+void human_readable_double(double bytes, char* output, char* end)
+{
+    char* suffix[] = {"B", "K", "M", "G", "T"};
+  	char length = sizeof(suffix) / sizeof(suffix[0]);
+    int i = 0;
+    while (bytes > 1024 && i < length - 1)
+    {
+        bytes /= 1024;
+        i++;
+	}
+    sprintf(output, "%.02lf %s%s", bytes, suffix[i], (end ? end : ""), i);
+}
+
+void human_readable(uint64_t bytes, char* output, char* end)
+{
+    human_readable_double(bytes, output, end);
+}
+
+#define PAD 20
 
 void process_packet(
         SSL* ssl,
@@ -298,20 +332,85 @@ void process_packet(
 
     if (suppressions.find(packet_type) != suppressions.end())
         return;
-    
+
+    // cls    
     fprintf(stdout, "%c%c", 033, 'c');
 
-    printf("Peer: %s\nPacket                    Count\t\tTotal Bytes\n", peer.c_str());
-
-    for (int i = 0; i < 128; ++i)
-    if (counters.find(i) != counters.end())
+    // display logic
     {
-        auto& p = counters[i];
-        printf("%s%llu\t\t%llu\n", packet_name(i, 1), p.first, p.second);
-    }
-    printf("\n\n");
+        time_t time_elapsed = time(NULL) - time_start;
+        if (time_elapsed <= 0) time_elapsed = 1;
 
-    printf("packet %s [%d] size %lu:\n", packet_name(packet_type, 0), packet_type, packet_len);
+        printf(
+            "XRPL-Peermon\nConnected to Peer: %s for %llu sec\n\n"
+            "Packet                    Total               Per second          Total Bytes         Data rate       \n"
+            "------------------------------------------------------------------------------------------------------\n"
+            ,peer.c_str(), time_elapsed);
+
+        double total_rate = 0;
+        uint64_t total_packets = 0;
+        uint64_t total_bytes = 0;
+
+        for (int i = 0; i < 128; ++i)
+        if (counters.find(i) != counters.end())
+        {
+            auto& p = counters[i];
+            double bps = ((double)(p.second))/(double)(time_elapsed);
+            double cps = ((double)(p.first))/(double)(time_elapsed);
+            total_bytes += p.second;
+            total_rate += p.second;
+            total_packets += p.first;
+
+            char bps_str[64];
+            bps_str[0] = '\0';
+
+            char bto_str[64];
+            bto_str[0] = '\0';
+
+            human_readable_double(bps, bps_str, "/s");
+            human_readable(p.second, bto_str, 0);
+            rpad(bto_str, PAD);
+
+            char cou_str[64];
+            cou_str[0] = '\0';
+            sprintf(cou_str, "%llu", p.first);
+            rpad(cou_str, PAD);
+
+            char cps_str[64];
+            cps_str[0] = '\0';
+            sprintf(cps_str, "%g", cps);
+            rpad(cps_str, PAD);
+
+            printf("%s%s%s%s%s\n", packet_name(i, 1), cou_str, cps_str, bto_str, bps_str);
+        }
+        total_rate /= ((double)(time_elapsed));
+
+        char bps_str[64];
+        bps_str[0] = '\0';
+        char bto_str[64];
+        bto_str[0] = '\0';
+        human_readable_double(total_rate, bps_str, "/s");
+        human_readable(total_bytes, bto_str, 0);
+        rpad(bto_str, PAD);
+            
+        char cou_str[64];
+        cou_str[0] = '\0';
+        sprintf(cou_str, "%llu", total_packets);
+        rpad(cou_str, PAD);
+
+        char cps_str[64];
+        cps_str[0] = '\0';
+        sprintf(cps_str, "%g", ((double)(total_packets))/((double)(time_elapsed)));
+        rpad(cps_str, PAD);
+
+        
+        printf(        
+            "------------------------------------------------------------------------------------------------------\n"
+            "Totals                    %s%s%s%s\n\n\n",
+            cou_str, cps_str, bto_str, bps_str);
+    }
+
+    printf("Latest packet: %s [%d] -- %lu bytes\n", packet_name(packet_type, 0), packet_type, packet_len);
 
 
     switch (packet_type)
@@ -496,6 +595,7 @@ int print_usage(int argc, char** argv, char* message)
     else
         fprintf(stderr, "A tool to connect to a rippled node as a peer and monitor the traffic it produces\n");
     fprintf(stderr, "Usage: %s PEER-IP PORT\n", argv[0]);
+    fprintf(stderr, "Example: %s r.ripple.com 51235\n", argv[0]);
     return 1;
 }
 
@@ -510,17 +610,33 @@ int main(int argc, char** argv)
     if (sscanf(argv[2], "%lu", &port) != 1)
         return print_usage(argc, argv, "Invalid port");
 
-    peer = std::string{argv[1]} + ":" + std::string{argv[2]};
+    int ip[4];
+    char* host = argv[1];
+    if (sscanf(host, "%lu.%lu.%lu.%lu", ip, ip+1, ip+2, ip+3) != 4)
+    {
+        // try do a hostname lookup
+        struct hostent* hn = gethostbyname(argv[1]);
+        if (!hn)
+            return print_usage(argc, argv, "Invalid IP/hostname (IPv4 ONLY)");
+        
+        struct in_addr** addr_list = (struct in_addr **)hn->h_addr_list;
+        host = inet_ntoa(*addr_list[0]);
+        if (sscanf(host, "%lu.%lu.%lu.%lu", ip, ip+1, ip+2, ip+3) != 4)
+            return print_usage(argc, argv, "Invalid IP after resolving hostname (IPv4 ONLY)");
+    }
+
+    peer = std::string{host} + ":" + std::string{argv[2]};
 
     //suppressions.emplace(3);
     //suppressions.emplace(30);
     //suppressions.emplace(41);
 
-    std::cout << "Suppressing: \n";
+/*    std::cout << "Suppressing: \n";
     for (int x : suppressions)
         std::cout << "\t" << packet_name(x, 0) << "\n";
 
     std::cout << "\n";
+*/
 
     b58_sha256_impl = calc_sha_256; 
     if (sodium_init() < 0) {
@@ -538,6 +654,8 @@ int main(int argc, char** argv)
     int fd = -1;
 
     fd = connect_peer(peer.c_str());
+
+    time_start = time(NULL);
 
     if (fd <= 0) {
         fprintf(stderr, "[FATAL] Could not connect\n"); // todo just return
