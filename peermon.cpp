@@ -41,6 +41,7 @@
 #include "xd.h"
 #define DEBUG 1
 #define PACKET_STACK_BUFFER_SIZE 2048
+//#define PACKET_STACK_BUFFER_SIZE 10
 
 
 std::string peer;
@@ -321,8 +322,13 @@ void process_packet(
         SSL* ssl,
         int packet_type,
         unsigned char* packet_buffer,
-        size_t packet_len)
+        size_t packet_len,
+        int compressed,
+        uint32_t uncompressed_size)
 {
+
+    if (suppressions.find(packet_type) != suppressions.end())
+        return;
 
     if (counters.find(packet_type) == counters.end())
         counters.emplace(std::pair<int, std::pair<uint64_t, uint64_t>>{packet_type, std::pair<uint64_t, uint64_t>{1,packet_len}});
@@ -331,92 +337,6 @@ void process_packet(
         auto& p = counters[packet_type];
         p.first++;
         p.second += packet_len;
-    }
-
-    if (suppressions.find(packet_type) != suppressions.end())
-        return;
-
-    // cls   
-    if (use_cls) 
-        fprintf(stdout, "%c%c", 033, 'c');
-
-    time_t time_now = time(NULL);
-    if (slow && time_now - last_print < 5)
-        return;
-    last_print = time_now;
-
-    // display logic
-    {
-        time_t time_elapsed = time_now - time_start;
-        if (time_elapsed <= 0) time_elapsed = 1;
-
-        printf(
-            "XRPL-Peermon\nConnected to Peer: %s for %llu sec\n\n"
-            "Packet                    Total               Per second          Total Bytes         Data rate       \n"
-            "------------------------------------------------------------------------------------------------------\n"
-            ,peer.c_str(), time_elapsed);
-
-        double total_rate = 0;
-        uint64_t total_packets = 0;
-        uint64_t total_bytes = 0;
-
-        for (int i = 0; i < 128; ++i)
-        if (counters.find(i) != counters.end())
-        {
-            auto& p = counters[i];
-            double bps = ((double)(p.second))/(double)(time_elapsed);
-            double cps = ((double)(p.first))/(double)(time_elapsed);
-            total_bytes += p.second;
-            total_rate += p.second;
-            total_packets += p.first;
-
-            char bps_str[64];
-            bps_str[0] = '\0';
-
-            char bto_str[64];
-            bto_str[0] = '\0';
-
-            human_readable_double(bps, bps_str, "/s");
-            human_readable(p.second, bto_str, 0);
-            rpad(bto_str, PAD);
-
-            char cou_str[64];
-            cou_str[0] = '\0';
-            sprintf(cou_str, "%llu", p.first);
-            rpad(cou_str, PAD);
-
-            char cps_str[64];
-            cps_str[0] = '\0';
-            sprintf(cps_str, "%g", cps);
-            rpad(cps_str, PAD);
-
-            printf("%s%s%s%s%s\n", packet_name(i, 1), cou_str, cps_str, bto_str, bps_str);
-        }
-        total_rate /= ((double)(time_elapsed));
-
-        char bps_str[64];
-        bps_str[0] = '\0';
-        char bto_str[64];
-        bto_str[0] = '\0';
-        human_readable_double(total_rate, bps_str, "/s");
-        human_readable(total_bytes, bto_str, 0);
-        rpad(bto_str, PAD);
-            
-        char cou_str[64];
-        cou_str[0] = '\0';
-        sprintf(cou_str, "%llu", total_packets);
-        rpad(cou_str, PAD);
-
-        char cps_str[64];
-        cps_str[0] = '\0';
-        sprintf(cps_str, "%g", ((double)(total_packets))/((double)(time_elapsed)));
-        rpad(cps_str, PAD);
-
-        
-        printf(        
-            "------------------------------------------------------------------------------------------------------\n"
-            "Totals                    %s%s%s%s\n\n\n",
-            cou_str, cps_str, bto_str, bps_str);
     }
 
     printf("Latest packet: %s [%d] -- %lu bytes\n", packet_name(packet_type, 0), packet_type, packet_len);
@@ -451,16 +371,9 @@ void process_packet(
         return;
     }
 
-    if (no_dump)
-        return;
 
 
-    if (manifests_only && packet_type != 2)
-    {
-        printf("Quiting due to manifests-only flag\n");
-        exit(0);
-    }
-    
+    if (!no_dump)    
     switch (packet_type)
     {
         case 2: // mtMANIFESTS
@@ -621,14 +534,113 @@ void process_packet(
         }
         default:
         {
-            printf(
-                "==== unknown contents ===[\n");
-            for (int i = 0; i < packet_len && i < 64; ++i)
-                printf("%02X", packet_buffer[i]);
-            printf("\n"
-                "]===(may be truncated)====\n");
+            printf("mtUnknown [%d] size = %d, %s (print capped at 128):\n", packet_type, packet_len,
+                    (compressed ? "compressed" : "uncompressed"));
+                
+            for (int j = 0; j < packet_len && j < 128; j++)
+            {
+                if (j % 16 == 0 && !raw_hex)
+                    printf("0x%08X:\t", j);
+
+                printf("%02X%s", packet_buffer[j],  (raw_hex ? "" : 
+                                        (j % 16 == 15 ? "\n" :
+                                        (j % 4 == 3 ? "  " :
+                                        (j % 2 == 1 ? " " : "")))));
+            }
+            printf("\n");
         }
     }
+    
+    // cls   
+    if (use_cls) 
+        fprintf(stdout, "%c%c", 033, 'c');
+
+    time_t time_now = time(NULL);
+    if (slow && time_now - last_print < 5)
+        return;
+    last_print = time_now;
+
+    // display logic
+    {
+        time_t time_elapsed = time_now - time_start;
+        if (time_elapsed <= 0) time_elapsed = 1;
+
+        printf(
+            "XRPL-Peermon\nConnected to Peer: %s for %llu sec\n\n"
+            "Packet                    Total               Per second          Total Bytes         Data rate       \n"
+            "------------------------------------------------------------------------------------------------------\n"
+            ,peer.c_str(), time_elapsed);
+
+        double total_rate = 0;
+        uint64_t total_packets = 0;
+        uint64_t total_bytes = 0;
+
+        for (int i = 0; i < 128; ++i)
+        if (counters.find(i) != counters.end())
+        {
+            auto& p = counters[i];
+            double bps = ((double)(p.second))/(double)(time_elapsed);
+            double cps = ((double)(p.first))/(double)(time_elapsed);
+            total_bytes += p.second;
+            total_rate += p.second;
+            total_packets += p.first;
+
+            char bps_str[64];
+            bps_str[0] = '\0';
+
+            char bto_str[64];
+            bto_str[0] = '\0';
+
+            human_readable_double(bps, bps_str, "/s");
+            human_readable(p.second, bto_str, 0);
+            rpad(bto_str, PAD);
+
+            char cou_str[64];
+            cou_str[0] = '\0';
+            sprintf(cou_str, "%llu", p.first);
+            rpad(cou_str, PAD);
+
+            char cps_str[64];
+            cps_str[0] = '\0';
+            sprintf(cps_str, "%g", cps);
+            rpad(cps_str, PAD);
+
+            printf("%s%s%s%s%s\n", packet_name(i, 1), cou_str, cps_str, bto_str, bps_str);
+        }
+        total_rate /= ((double)(time_elapsed));
+
+        char bps_str[64];
+        bps_str[0] = '\0';
+        char bto_str[64];
+        bto_str[0] = '\0';
+        human_readable_double(total_rate, bps_str, "/s");
+        human_readable(total_bytes, bto_str, 0);
+        rpad(bto_str, PAD);
+            
+        char cou_str[64];
+        cou_str[0] = '\0';
+        sprintf(cou_str, "%llu", total_packets);
+        rpad(cou_str, PAD);
+
+        char cps_str[64];
+        cps_str[0] = '\0';
+        sprintf(cps_str, "%g", ((double)(total_packets))/((double)(time_elapsed)));
+        rpad(cps_str, PAD);
+
+        
+        printf(        
+            "------------------------------------------------------------------------------------------------------\n"
+            "Totals                    %s%s%s%s\n\n\n",
+            cou_str, cps_str, bto_str, bps_str);
+    }
+
+    if (manifests_only && packet_type != 2)
+    {
+        printf("Quiting due to manifests-only flag\n");
+        exit(0);
+    }
+    
+
 }
 
 int print_usage(int argc, char** argv, char* message)
@@ -748,7 +760,7 @@ int main(int argc, char** argv)
 
     int pc = 0;
     while (fd_valid(fd)) {
-        bufferlen = SSL_read(ssl, buffer, PACKET_STACK_BUFFER_SIZE); 
+        bufferlen = SSL_read(ssl, buffer, (pc == 0 ? PACKET_STACK_BUFFER_SIZE : 10)); 
         if (bufferlen == 0)
         {
             fprintf(stderr, "Server stopped responding\n");
@@ -778,26 +790,67 @@ int main(int argc, char** argv)
 //        }
 
         // first 4 bytes are bigendian payload size
-        uint32_t payload_size = (buffer[0] << 24) + (buffer[1] << 16) + (buffer[2] << 8) + buffer[3];
+        uint32_t payload_size = 
+            (buffer[0] << 24) + (buffer[1] << 16) + (buffer[2] << 8) + buffer[3];
+        int compressed = payload_size >> 28U;
+        
+        if (compressed)
+            payload_size &= 0x0FFFFFFFU;
+
         uint16_t packet_type = (buffer[4] << 8) + buffer[5];
 
+        uint32_t uncompressed_size = payload_size;
+        if (compressed)
+            uncompressed_size = 
+                (buffer[6] << 24) + (buffer[7] << 16) + (buffer[8] << 8) + buffer[9];
+
+        int header_size = (compressed ? 10 : 6);
+
+        printf("HEADER: %02X%02X%02X%02X %02X%02X %02X%02X%02X%02X\n", buffer[0], buffer[1], buffer[2], buffer[3],
+                buffer[4], buffer[5],
+                buffer[6], buffer[7], buffer[8], buffer[9]);
 
         // the vast majority of packets will fit in the stack buffer, but for those which do not, we will read the rest into heap
-        if (payload_size + 6 > bufferlen) {
+        if (payload_size + header_size > bufferlen)
+        {
+
+            printf("payload_size[%d] + header_size[%d] = %d, bufferlen = %d\n",
+                    payload_size, header_size, payload_size + header_size, bufferlen); 
             // incomplete packet, receive the rest into a heap buffer
-            size_t bufferlen2 = payload_size;
-            unsigned char* heapbuf = (unsigned char*) malloc( bufferlen2 );
-            bufferlen2 = SSL_read(ssl, heapbuf + bufferlen, bufferlen2);
+            
+            size_t total_read = bufferlen - header_size;
 
-            for (size_t i = 0; i < bufferlen; ++i) heapbuf[i] = buffer[i + 6];
+            unsigned char* heapbuf = (unsigned char*) malloc( payload_size );
+            
+            // inefficient copy
+            for (size_t i = header_size; i < bufferlen; ++i)
+                heapbuf[i - header_size] = buffer[i];
 
-            process_packet( ssl, packet_type, heapbuf, payload_size );
+
+            while (total_read < payload_size)
+            {
+                size_t bytes_read = SSL_read(ssl, heapbuf + total_read, payload_size - total_read);
+                if (bytes_read == 0)
+                {
+                    fprintf(stderr, "Error reading / disconnect\n");
+                    exit(1);
+                }
+                printf("Large message... read %d bytes of %d...\n", bytes_read, payload_size);
+                total_read += bytes_read;
+            }
+
+            printf("payload_size: %d  toal_read: %d\n", payload_size, total_read);
+
+            process_packet(
+                    ssl, packet_type, heapbuf, payload_size, compressed, uncompressed_size);
+            
             free(heapbuf);
 
             continue;
         }
 
-        process_packet( ssl, packet_type, buffer+6, bufferlen-6 );
+        process_packet(
+                ssl, packet_type, buffer + header_size, bufferlen - header_size, compressed, uncompressed_size);
         
     }
 
