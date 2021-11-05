@@ -18,6 +18,8 @@
 #include <stdio.h>
 #include <secp256k1.h>
 #include <sys/stat.h>
+#include <sys/types.h>
+
 #include <fcntl.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -35,7 +37,8 @@
 #include "ripple.pb.h"
 
 #include "stlookup.h"
-#include  <netdb.h>
+#include <netdb.h>
+#include <pwd.h>
 
 #include "sha-256.h"
 #include "xd.h"
@@ -184,9 +187,17 @@ int generate_node_keys(
     }
 
     // fixed key mode
-    int keyfd = open("~/.peermon", O_RDONLY);
+    struct passwd *pw = getpwuid(getuid());
+    const char *homedir = pw->pw_dir;
+
+    char keyfn[256];
+    strcpy(keyfn, homedir);
+    strcat(keyfn, "/.peermon");
+
+    int keyfd = open(keyfn, O_RDONLY);
     if (!(keyfd >= 0 && read(keyfd, outsec32, 32) == 32))
     {
+        printf("Random key\n");
         result = read(rndfd, outsec32, 32);
         if (result != 32) {
             fprintf(stderr, "[FATAL] Could not read 32 bytes from /dev/urandom\n");
