@@ -1,5 +1,5 @@
 
-#define VERSION "1.1"
+#define VERSION "1.2"
 #include <sodium.h>
 
 #include <iostream>
@@ -46,6 +46,70 @@
 
 std::string peer;
 time_t time_start;
+
+
+
+// these are defaults set at startup according to cmdline flags
+int use_cls = 1, no_dump = 0, slow = 0, manifests_only = 0, raw_hex = 0, no_stats = 0, no_http = 0, no_hex = 0;
+int stricmp(const uint8_t* a, const uint8_t* b)
+{
+    int ca, cb;
+    do {
+        ca = (unsigned char) *a++;
+        cb = (unsigned char) *b++;
+        ca = tolower(toupper(ca));
+        cb = tolower(toupper(cb));
+    } while (ca == cb && ca != '\0');
+    return ca - cb;
+}
+
+int strnicmp(const uint8_t* a, const uint8_t* b, int n)
+{
+    int ca, cb;
+    do {
+        ca = (unsigned char) *a++;
+        cb = (unsigned char) *b++;
+        ca = tolower(toupper(ca));
+        cb = tolower(toupper(cb));
+    } while (ca == cb && ca != '\0' && --n > 0);
+    return ca - cb;
+}
+
+void print_sto(const std::string& st)
+{
+    // hacky way to add \0 to the end due to bug in deserializer
+    uint8_t* input = malloc(st.size() + 1);
+    int i = 0;
+    for (unsigned char c : st)
+        input[i++] = c;
+    input[i] = '\0';
+
+    uint8_t* output = 0;
+    if (!deserialize(&output, input, st.size() + 1, 0, 0, 0))
+        return fprintf(stderr, "Could not deserialize\n");
+    printf("%s\n", output);
+    free(output);
+    free(input);
+}
+
+void print_hex(uint8_t* packet_buffer, int packet_len)
+{
+    if (no_hex)
+        return;
+
+    for (int j = 0; j < packet_len; j++)
+    {
+        if (j % 16 == 0 && !raw_hex)
+            printf("0x%08X:\t", j);
+
+        printf("%02X%s", packet_buffer[j],
+            (raw_hex ? "" : 
+            (j % 16 == 15 ? "\n" :
+            (j % 4 == 3 ? "  " :
+            (j % 2 == 1 ? " " : "")))));
+    }
+    printf("\n");
+}
 
 template<class... Args>
 int printd(Args ... args)
@@ -112,16 +176,22 @@ int generate_node_keys(
         exit(2);
     }
 
+
+
     if (!secp256k1_context_randomize(ctx, seed)) {
         fprintf(stderr, "[FATAL] Could not randomize secp256k1 context\n");
         exit(3);
     }
 
-
-    result = read(rndfd, outsec32, 32);
-    if (result != 32) {
-        fprintf(stderr, "[FATAL] Could not read 32 bytes from /dev/urandom\n");
-        exit(4);
+    // fixed key mode
+    int keyfd = open("~/.peermon", O_RDONLY);
+    if (!(keyfd >= 0 && read(keyfd, outsec32, 32) == 32))
+    {
+        result = read(rndfd, outsec32, 32);
+        if (result != 32) {
+            fprintf(stderr, "[FATAL] Could not read 32 bytes from /dev/urandom\n");
+            exit(4);
+        }
     }
 
     secp256k1_pubkey* pubkey = (secp256k1_pubkey*)((void*)(outpubraw64));
@@ -226,13 +296,20 @@ SSL* ssl_handshake_and_upgrade(secp256k1_context* secp256k1ctx, int fd, SSL_CTX*
     sodium_bin2base64(buf2, buflen2, buf, buflen, sodium_base64_VARIANT_ORIGINAL);
 
     buf2[buflen2] = '\0';
-    printf("base64: %s\n", buf2);
-
 
     char buf3[2048];
-    size_t buf3len = snprintf(buf3, 2047, "GET / HTTP/1.1\r\nUser-Agent: rippled-1.8.0\r\nUpgrade: RTXP/1.2\r\nConnection: Upgrade\r\nConnect-As: Peer\r\nCrawl: private\r\nSession-Signature: %s\r\nPublic-Key: %s\r\n\r\n", buf2, b58);
+    size_t buf3len = snprintf(buf3, 2047, 
+            "GET / HTTP/1.1\r\n"
+            "User-Agent: rippled-1.8.0\r\n"
+            "Upgrade: RTXP/1.2\r\n"
+            "Connection: Upgrade\r\n"
+            "Connect-As: Peer\r\n"
+            "Crawl: private\r\n"
+            "Session-Signature: %s\r\n"
+            "Public-Key: %s\r\n\r\n", buf2, b58);
 
-    printf("To write:\n%s", buf3);
+    if (!no_http)
+        printf("To write:\n%s", buf3);
 
     if (SSL_write(ssl, buf3, buf3len) <= 0) {
         fprintf(stderr, "[FATAL] Failed to write bytes to openssl fd\n");
@@ -281,9 +358,38 @@ const char* packet_name(
 }
 
 
+int32_t packet_id(char* packet_name)
+{
+    if (stricmp("mtMANIFESTS", packet_name) == 0) return 2;
+    if (stricmp("mtPING", packet_name) == 0) return 3;
+    if (stricmp("mtCLUSTER", packet_name) == 0) return 5;
+    if (stricmp("mtENDPOINTS", packet_name) == 0) return 15;
+    if (stricmp("mtTRANSACTION", packet_name) == 0) return 30;
+    if (stricmp("mtGET_LEDGER", packet_name) == 0) return 31;
+    if (stricmp("mtLEDGER_DATA", packet_name) == 0) return 32;
+    if (stricmp("mtPROPOSE_LEDGER", packet_name) == 0) return 33;
+    if (stricmp("mtSTATUS_CHANGE", packet_name) == 0) return 34;
+    if (stricmp("mtHAVE_SET", packet_name) == 0) return 35;
+    if (stricmp("mtVALIDATION", packet_name) == 0) return 41;
+    if (stricmp("mtGET_OBJECTS", packet_name) == 0) return 42;
+    if (stricmp("mtGET_SHARD_INFO", packet_name) == 0) return 50;
+    if (stricmp("mtSHARD_INFO", packet_name) == 0) return 51;
+    if (stricmp("mtGET_PEER_SHARD_INFO", packet_name) == 0) return 52;
+    if (stricmp("mtPEER_SHARD_INFO", packet_name) == 0) return 53;
+    if (stricmp("mtVALIDATORLIST", packet_name) == 0) return 54;
+    if (stricmp("mtSQUELCH", packet_name) == 0) return 55;
+    if (stricmp("mtVALIDATORLISTCOLLECTION", packet_name) == 0) return 56;
+    if (stricmp("mtPROOF_PATH_REQ", packet_name) == 0) return 57;
+    if (stricmp("mtPROOF_PATH_RESPONSE", packet_name) == 0) return 58;
+    if (stricmp("mtREPLAY_DELTA_REQ", packet_name) == 0) return 59;
+    if (stricmp("mtREPLAY_DELTA_RESPONSE", packet_name) == 0) return 60;
+    if (stricmp("mtGET_PEER_SHARD_INFO_V2", packet_name) == 0) return 61;
+    if (stricmp("mtPEER_SHARD_INFO_V2", packet_name) == 0) return 62;
+    if (stricmp("mtHAVE_TRANSACTIONS", packet_name) == 0) return 63;
+    if (stricmp("mtTRANSACTIONS", packet_name) == 0) return 64;
+    return -1;
+}
 
-
-std::set<int> suppressions;
 std::map<int, std::pair<uint64_t, uint64_t>> counters; // packet type => [ packet_count, total_bytes ];
 
 
@@ -315,8 +421,10 @@ void human_readable(uint64_t bytes, char* output, char* end)
 
 #define PAD 20
 
-int use_cls = 1, no_dump = 0, slow = 0, manifests_only = 0, raw_hex = 0;
 time_t last_print = 0;
+
+std::set<int> show; // if this is set then only show these packets
+std::set<int> hide; // if this is set then only show packets other than these packets, this is mut excl with above
 
 void process_packet(
         SSL* ssl,
@@ -327,9 +435,6 @@ void process_packet(
         uint32_t uncompressed_size)
 {
 
-    if (suppressions.find(packet_type) != suppressions.end())
-        return;
-    
     time_t time_now = time(NULL);
     int display = (slow ? 0 : 1);
 
@@ -350,8 +455,6 @@ void process_packet(
         p.second += packet_len;
     }
 
-    if (display)
-        printf("Latest packet: %s [%d] -- %lu bytes\n", packet_name(packet_type, 0), packet_type, packet_len);
 
     if (packet_type == 3) //mtPing
     {
@@ -385,181 +488,175 @@ void process_packet(
 
 
 
-    if (!no_dump && display)
-    switch (packet_type)
+    if (!no_dump && display &&
+            ((show.size() > 0 && show.find(packet_type) != show.end()) ||
+            (hide.size() > 0 && hide.find(packet_type) == hide.end()) ||
+            (show.size() == 0 && hide.size() == 0)))
     {
-        case 2: // mtMANIFESTS
+        switch (packet_type)
         {
-            protocol::TMManifests mans;
-            bool success = mans.ParseFromArray(packet_buffer, packet_len);
-            printf("parsed manifests: %s\n", (success ? "yes" : "no"));
-
-            printf("mtManifests contains %d manifests\n", mans.list_size());
-            for (int i = 0; i < mans.list_size(); ++i)
+            case 2: // mtMANIFESTS
             {
-                protocol::TMManifest const& man = mans.list(i);
-                const std::string& sto = man.stobject();
-                printf("Manifest %d is %d bytes:\n", i, sto.size());
-                const unsigned char* x = (const unsigned char*)(sto.c_str());
-                for (int j = 0; j < sto.size(); j++)
+                protocol::TMManifests mans;
+                bool success = mans.ParseFromArray(packet_buffer, packet_len);
+                printf("parsed manifests: %s\n", (success ? "yes" : "no"));
+
+                printf("mtManifests contains %d manifests\n", mans.list_size());
+                for (int i = 0; i < mans.list_size(); ++i)
                 {
-                    if (j % 16 == 0 && !raw_hex)
-                        printf("0x%08X:\t", j);
-
-                    printf("%02X%s", x[j],  (raw_hex ? "" : 
-                                            (j % 16 == 15 ? "\n" :
-                                            (j % 4 == 3 ? "  " :
-                                            (j % 2 == 1 ? " " : "")))));
+                    protocol::TMManifest const& man = mans.list(i);
+                    const std::string& sto = man.stobject();
+                    printf("Manifest %d is %d bytes:\n", i, sto.size());
+                    const unsigned char* x = (const unsigned char*)(sto.c_str());
+                    print_hex(x, sto.size());
                 }
-                printf("\n");
+                break;
             }
-            break;
-        }
-        case 5: // mtCLUSTER
-        {
-            break;
-        }
-        case 15: // mtENDPOINTS
-        {
-            break;
-        }
-        case 30: // mtTRANSACTION
-        {   //rawTransaction
-            protocol::TMTransaction txn;
-            bool success = txn.ParseFromArray( packet_buffer, packet_len );
-            printf("parsed transaction: %s\n", (success ? "yes" : "no") );
-            const std::string& st = txn.rawtransaction();
-            printf("sttransaction data: ");
-            for (unsigned char c : st)
-                printf("%02X", c);
-
-            printf("\n");
-            uint8_t* output = 0;
-            if (!deserialize(&output, st.c_str(), st.size(), 0, 0, 0))
-                return fprintf(stderr, "Could not deserialize\n");
-            printf("%s\n", output);
-            free(output);
-            break;
-            break;
-        }
-        case 31: // mtGET_LEDGER
-        {
-            break;
-        }
-        case 32: // mtLEDGER_DATA
-        {
-            break;
-        }
-        case 33: // mtPROPOSE_LEDGER
-        {
-            break;
-        }
-        case 34: // mtSTATUS_CHANGE
-        {
-            break;
-        }
-        case 35: // mtHAVE_SET
-        {
-            break;
-        }
-        case 41: // mtVALIDATION
-        {
-            protocol::TMValidation validation;
-            bool success = validation.ParseFromArray( packet_buffer, packet_len );
-            printf("parsed validation: %s\n", (success ? "yes" : "no") );
-            const std::string& stvalidation = validation.validation();
-            printf("stvalidation data: ");
-            for (unsigned char c : stvalidation)
-                printf("%02X", c);
-
-            printf("\n");
-            uint8_t* output = 0;
-            if (!deserialize(&output, stvalidation.c_str(), stvalidation.size(), 0, 0, 0))
-                return fprintf(stderr, "Could not deserialize\n");
-            printf("%s\n", output);
-            free(output);
-            break;
-        }
-        case 42: // mtGET_OBJECTS
-        {
-            break;
-        }
-        case 50: // mtGET_SHARD_INFO
-        {
-            break;
-        }
-        case 51: // mtSHARD_INFO
-        {
-            break;
-        }
-        case 52: // mtGET_PEER_SHARD_INFO
-        {
-            break;
-        }
-        case 53: // mtPEER_SHARD_INFO
-        {
-            break;
-        }
-        case 54: // mtVALIDATORLIST
-        {
-            break;
-        }
-        case 55: // mtSQUELCH
-        {
-            break;
-        }
-        case 56: // mtVALIDATORLISTCOLLECTION
-        {
-            break;
-        }
-        case 57: // mtPROOF_PATH_REQ
-        {
-            break;
-        }
-        case 58: // mtPROOF_PATH_RESPONSE
-        {
-            break;
-        }
-        case 59: // mtREPLAY_DELTA_REQ
-        {
-            break;
-        }
-        case 60: // mtREPLAY_DELTA_RESPONSE
-        {
-            break;
-        }
-        case 61: // mtGET_PEER_SHARD_INFO_V2
-        {
-            break;
-        }
-        case 62: // mtPEER_SHARD_INFO_V2
-        {
-            break;
-        }
-        case 63: // mtHAVE_TRANSACTIONS
-        {
-            break;
-        }
-        case 64: // mtTRANSACTIONS
-        {
-            break;
-        }
-        default:
-        {
-            printf("mtUnknown [%d] size = %d, %s (print capped at 128):\n", packet_type, packet_len,
-                    (compressed ? "compressed" : "uncompressed"));
-                
-            for (int j = 0; j < packet_len && j < 128; j++)
+            case 5: // mtCLUSTER
             {
-                if (j % 16 == 0 && !raw_hex)
-                    printf("0x%08X:\t", j);
-
-                printf("%02X%s", packet_buffer[j],  (raw_hex ? "" : 
-                                        (j % 16 == 15 ? "\n" :
-                                        (j % 4 == 3 ? "  " :
-                                        (j % 2 == 1 ? " " : "")))));
+                break;
             }
-            printf("\n");
+            case 15: // mtENDPOINTS
+            {
+                break;
+            }
+            case 30: // mtTRANSACTION
+            {   //rawTransaction
+                protocol::TMTransaction txn;
+                bool success = txn.ParseFromArray( packet_buffer, packet_len );
+                printf("%llu mtTRANSACTION %s\n", time(NULL), (success ? "" : "<error parsing>") );
+                const std::string& st = txn.rawtransaction();
+                print_hex(st.c_str(), st.size());
+                if (success)
+                    print_sto(st);
+                break;
+                break;
+            }
+            case 31: // mtGET_LEDGER
+            {
+                protocol::TMGetLedger gl;
+                bool success = gl.ParseFromArray( packet_buffer, packet_len );
+                uint32_t info_type = gl.itype();
+                uint32_t ledger_type = gl.ltype();
+                uint8_t* ledger_hash = (uint8_t*)(gl.ledgerhash().c_str());
+                uint32_t ledger_seq = gl.ledgerseq();
+               
+                uint32_t len = gl.nodeids_size();
+
+                printf("%llu mtGET_LEDGER seq=%lu hash=", time(NULL), ledger_seq);
+                for (int i = 0; i < 32; ++i)
+                    printf("%02X", ledger_hash[i]);
+                printf(" itype=%d ltype=%d", info_type, ledger_type);
+
+                /*
+                for (int i = 0; i < len; ++i)
+                {
+                    const std::string& id = gl.nodeids(i);
+                }
+                */
+
+                break;
+            }
+            case 32: // mtLEDGER_DATA
+            {
+                break;
+            }
+            case 33: // mtPROPOSE_LEDGER
+            {
+                break;
+            }
+            case 34: // mtSTATUS_CHANGE
+            {
+                break;
+            }
+            case 35: // mtHAVE_SET
+            {
+                break;
+            }
+            case 41: // mtVALIDATION
+            {
+                protocol::TMValidation validation;
+                bool success = validation.ParseFromArray( packet_buffer, packet_len );
+                const std::string& stvalidation = validation.validation();
+                printf("%d mtVALIDATION %s\n", time(NULL), (success ? "":"<error parsing>"));
+                print_hex(stvalidation.c_str(), stvalidation.size());
+                
+                if (success)
+                    print_sto(stvalidation);
+                break;
+            }
+            case 42: // mtGET_OBJECTS
+            {
+                break;
+            }
+            case 50: // mtGET_SHARD_INFO
+            {
+                break;
+            }
+            case 51: // mtSHARD_INFO
+            {
+                break;
+            }
+            case 52: // mtGET_PEER_SHARD_INFO
+            {
+                break;
+            }
+            case 53: // mtPEER_SHARD_INFO
+            {
+                break;
+            }
+            case 54: // mtVALIDATORLIST
+            {
+                break;
+            }
+            case 55: // mtSQUELCH
+            {
+                break;
+            }
+            case 56: // mtVALIDATORLISTCOLLECTION
+            {
+                break;
+            }
+            case 57: // mtPROOF_PATH_REQ
+            {
+                break;
+            }
+            case 58: // mtPROOF_PATH_RESPONSE
+            {
+                break;
+            }
+            case 59: // mtREPLAY_DELTA_REQ
+            {
+                break;
+            }
+            case 60: // mtREPLAY_DELTA_RESPONSE
+            {
+                break;
+            }
+            case 61: // mtGET_PEER_SHARD_INFO_V2
+            {
+                break;
+            }
+            case 62: // mtPEER_SHARD_INFO_V2
+            {
+                break;
+            }
+            case 63: // mtHAVE_TRANSACTIONS
+            {
+                break;
+            }
+            case 64: // mtTRANSACTIONS
+            {
+                break;
+            }
+            default:
+            {
+                printf("mtUnknown [%d] size = %d, %s (print capped at 128):\n", packet_type, packet_len,
+                        (compressed ? "compressed" : "uncompressed"));
+                    
+                print_hex(packet_buffer, packet_len);
+
+            }
         }
     }
     
@@ -568,13 +665,13 @@ void process_packet(
         fprintf(stdout, "%c%c", 033, 'c');
 
     // display logic
-    if (display)
+    if (display && !no_stats)
     {
         time_t time_elapsed = time_now - time_start;
         if (time_elapsed <= 0) time_elapsed = 1;
 
         printf(
-            "XRPL-Peermon\nConnected to Peer: %s for %llu sec\n\n"
+            "XRPL-Peermon -- Connected to Peer: %s for %llu sec\n\n"
             "Packet                    Total               Per second          Total Bytes         Data rate       \n"
             "------------------------------------------------------------------------------------------------------\n"
             ,peer.c_str(), time_elapsed);
@@ -640,6 +737,7 @@ void process_packet(
             "------------------------------------------------------------------------------------------------------\n"
             "Totals                    %s%s%s%s\n\n\n",
             cou_str, cps_str, bto_str, bps_str);
+        printf("Latest packet: %s [%d] -- %lu bytes\n", packet_name(packet_type, 0), packet_type, packet_len);
     }
 
     if (manifests_only && packet_type != 2)
@@ -653,19 +751,39 @@ void process_packet(
 
 int print_usage(int argc, char** argv, char* message)
 {
-    fprintf(stderr, "XRPL Peer Monitor\nVersion: %s\nAuthor: Richard Holland / XRPL-Labs\n", VERSION);
+    fprintf(stderr, "XRPL Peer Monitor\nVersion: %s\nRichard Holland / XRPL-Labs\n", VERSION);
     if (message)
         fprintf(stderr, "Error: %s\n", message);
     else
         fprintf(stderr, "A tool to connect to a rippled node as a peer and monitor the traffic it produces\n");
-    fprintf(stderr, "Usage: %s PEER-IP PORT [OPTIONS]\n", argv[0]);
+    fprintf(stderr, "Usage: %s PEER-IP PORT [OPTIONS] [show:mtPACKET,... | hide:mtPACKET,...]\n", argv[0]);
     fprintf(stderr, "Options:\n"
-            "\tno-cls\t\t- Don't clear the screen between printing stats.\n"
-            "\tno-dump\t\t- Don't dump the latest packet contents.\n"
-            "\tslow\t\t- Only print at most once every 5 seconds.\n"
+            "\tslow\t\t- Only print at most once every 5 seconds. Will skip displaying most packets. Use for stats.\n"
+            "\tno-cls\t\t- Don't clear the screen between printing. If you're after packet contents use this.\n"
+            "\tno-dump\t\t- Don't dump any packet contents.\n"
+            "\tno-stats\t- Don't produce stats.\n"
+            "\tno-http\t\t- Don't output HTTP upgrade.\n"
             "\tmanifests-only\t- Only collect and print manifests then exit.\n"
-            "\traw\t\t- Print raw hex where appropriate instead of giving it line numbers and spacing.\n");
-    fprintf(stderr, "Example: %s r.ripple.com 51235\n", argv[0]);
+            "\traw-hex\t\t- Print raw hex where appropriate instead of giving it line numbers and spacing.\n"
+            "\tno-hex\t\t- Never print hex, only parsed / able-to-be-parsed STObjects or omit.\n"
+            );
+    fprintf(stderr, "Show / Hide:\n"
+            "\tshow:mtPACKET[,mtPACKET...]\t\t- Show only the packets in the comma seperated list (no spaces!)\n"
+            "\thide:mtPACKET[,mtPACKET...]\t\t- Show all packets except those in the comma seperated list.\n"
+           );
+    fprintf(stderr, "Packet Types:\n"
+    "\tmtMANIFESTS mtPING mtCLUSTER mtENDPOINTS mtTRANSACTION mtGET_LEDGER mtLEDGER_DATA mtPROPOSE_LEDGER\n"
+    "\tmtSTATUS_CHANGE mtHAVE_SET mtVALIDATION mtGET_OBJECTS mtGET_SHARD_INFO mtSHARD_INFO mtGET_PEER_SHARD_INFO\n"
+    "\tmtPEER_SHARD_INFO mtVALIDATORLIST mtSQUELCH mtVALIDATORLISTCOLLECTION mtPROOF_PATH_REQ mtPROOF_PATH_RESPONSE\n"
+    "\tmtREPLAY_DELTA_REQ mtREPLAY_DELTA_RESPONSE mtGET_PEER_SHARD_INFO_V mtPEER_SHARD_INFO_V mtHAVE_TRANSACTIONS\n"
+    "\tmtTRANSACTIONS\n");
+    fprintf(stderr, "Keys:\n"
+            "\tWhen connecting, peermon choses a random secp256k1 node key for itself.\n"
+            "\tIf this is not the behaviour you want please place a binary 32 byte key file at ~/.peermon.\n");
+    fprintf(stderr, "Example:\n"
+        "\t%s r.ripple.com 51235 no-dump\t\t\t\t\t# display realtime stats for this node\n"
+        "\t%s r.ripple.com 51235 no-cls no-stats show:mtGET_LEDGER\t\t# show only the GET_LEDGER packets"
+        "\n", argv[0], argv[0]);
     return 1;
 }
 
@@ -705,30 +823,69 @@ int main(int argc, char** argv)
 
     for (int i = 3; i < argc; ++i)
     {
-        if (strcmp(argv[i], "no-cls") == 0)
+
+        size_t len = strlen(argv[i]);
+        char* opt = argv[i];
+        if (strcmp(opt, "no-cls") == 0)
             use_cls = 0;
-        else if (strcmp(argv[i], "no-dump") == 0)
+        else if (strcmp(opt, "no-dump") == 0)
             no_dump = 1;
-        else if (strcmp(argv[i], "slow") == 0)
+        else if (strcmp(opt, "no-stats") == 0)
+            no_stats = 1;
+        else if (strcmp(opt, "no-http") == 0)
+            no_http = 1;
+        else if (strcmp(opt, "slow") == 0)
             slow = 1;
-        else if (strcmp(argv[i], "manifests-only") == 0)
+        else if (strcmp(opt, "manifests-only") == 0)
             manifests_only = 1;
-        else if (strcmp(argv[i], "raw") == 0)
+        else if (strcmp(opt, "raw-hex") == 0)
+        {
+            if (no_hex)
+                return fprintf(stderr, "Incompatible options: no-hex and raw-hex\n");
             raw_hex = 1;
+        }
+        else if (strcmp(opt, "no-hex") == 0)
+        {
+            if (raw_hex)
+                return fprintf(stderr, "Incompatible options: no-hex and raw-hex\n");
+            no_hex = 1;
+        }
+        else if (len > 5 && (memcmp(opt, "show:", 5) == 0 || memcmp(opt, "hide:", 5) == 0))
+        {
+            std::set<int>* showhide = NULL;
+            if (len > 5 && memcmp(opt, "show:", 5) == 0)
+            {
+                if (hide.size() > 0)
+                    return print_usage(argc, argv, "Choose either show or hide, not both.");
+                opt += 5;
+                showhide = &show;
+            }
+            else if (len > 5 && memcmp(opt, "hide:", 5) == 0)
+            {
+                if (show.size() > 0)
+                    return print_usage(argc, argv, "Choose either show or hide, not both.");
+                opt += 5;
+                showhide = &hide;
+            }
+
+            char tmp[1024]; tmp[1023] = '\0';
+            strncpy(tmp, opt, 1023);
+
+            char* ptr = strtok(tmp, ",");
+            while (ptr != NULL)
+            {
+                int packet = packet_id(ptr);
+                if (packet == -1)
+                    return fprintf(stderr, "Invalid packet type: `%s`\n", ptr);
+
+                showhide->emplace(packet);
+                ptr = strtok(NULL, ",");
+            }
+        }
         else
-            return print_usage(argc, argv, "Valid options: no-cls");
+            return print_usage(argc, argv, "Invalid option");
     }
 
-    //suppressions.emplace(3);
-    //suppressions.emplace(30);
-    //suppressions.emplace(41);
-
-/*    std::cout << "Suppressing: \n";
-    for (int x : suppressions)
-        std::cout << "\t" << packet_name(x, 0) << "\n";
-
-    std::cout << "\n";
-*/
 
     b58_sha256_impl = calc_sha_256; 
     if (sodium_init() < 0) {
@@ -777,7 +934,8 @@ int main(int argc, char** argv)
 
         buffer[bufferlen] = '\0';
         if (!pc) {
-            printf("Returned:\n%s", buffer);
+            if (!no_http)
+                printf("Returned:\n%s", buffer);
 
             if (bufferlen >= sizeof("HTTP/1.1 503 Service Unavailable")-1 &&
                 memcmp(buffer, "HTTP/1.1 503 Service Unavailable", sizeof("HTTP/1.1 503 Service Unavailable")-1) == 0)
