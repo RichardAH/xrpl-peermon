@@ -546,7 +546,7 @@ void process_packet(
                 printf("%llu mtGET_LEDGER seq=%lu hash=", time(NULL), ledger_seq);
                 for (int i = 0; i < 32; ++i)
                     printf("%02X", ledger_hash[i]);
-                printf(" itype=%d ltype=%d", info_type, ledger_type);
+                printf(" itype=%d ltype=%d\n", info_type, ledger_type);
 
                 /*
                 for (int i = 0; i < len; ++i)
@@ -775,7 +775,7 @@ int print_usage(int argc, char** argv, char* message)
     "\tmtMANIFESTS mtPING mtCLUSTER mtENDPOINTS mtTRANSACTION mtGET_LEDGER mtLEDGER_DATA mtPROPOSE_LEDGER\n"
     "\tmtSTATUS_CHANGE mtHAVE_SET mtVALIDATION mtGET_OBJECTS mtGET_SHARD_INFO mtSHARD_INFO mtGET_PEER_SHARD_INFO\n"
     "\tmtPEER_SHARD_INFO mtVALIDATORLIST mtSQUELCH mtVALIDATORLISTCOLLECTION mtPROOF_PATH_REQ mtPROOF_PATH_RESPONSE\n"
-    "\tmtREPLAY_DELTA_REQ mtREPLAY_DELTA_RESPONSE mtGET_PEER_SHARD_INFO_V mtPEER_SHARD_INFO_V mtHAVE_TRANSACTIONS\n"
+    "\tmtREPLAY_DELTA_REQ mtREPLAY_DELTA_RESPONSE mtGET_PEER_SHARD_INFO_V2 mtPEER_SHARD_INFO_V2 mtHAVE_TRANSACTIONS\n"
     "\tmtTRANSACTIONS\n");
     fprintf(stderr, "Keys:\n"
             "\tWhen connecting, peermon choses a random secp256k1 node key for itself.\n"
