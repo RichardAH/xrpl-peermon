@@ -578,6 +578,97 @@ void process_packet(
             }
             case 34: // mtSTATUS_CHANGE
             {
+/*
+
+
+enum NodeStatus
+{
+    nsCONNECTING    = 1;        // acquiring connections
+    nsCONNECTED     = 2;        // convinced we are connected to the real network
+    nsMONITORING    = 3;        // we know what the previous ledger is
+    nsVALIDATING    = 4;        // we have the full ledger contents
+    nsSHUTTING      = 5;        // node is shutting down
+}
+
+enum NodeEvent
+{
+    neCLOSING_LEDGER    = 1;    // closing a ledger because its close time has come
+    neACCEPTED_LEDGER   = 2;    // accepting a closed ledger, we have finished computing it
+    neSWITCHED_LEDGER   = 3;    // changing due to network consensus
+    neLOST_SYNC         = 4;
+}
+*/
+                protocol::TMStatusChange status;
+                bool success = status.ParseFromArray(packet_buffer, packet_len);
+
+                printf("%d mtSTATUS_CHANGE %s", time(NULL), (success ? "": "<error parsing>"));
+
+
+                if (status.has_newstatus())
+                {
+                    int s = status.newstatus();
+                    printf(" stat=%d %s", s,
+                            (s == 1 ? "CONNECTING" :
+                             (s == 2 ? "CONNECTED" :
+                              (s == 3 ? "MONITORING" :
+                               (s == 4 ? "VALIDATING" :
+                                (s == 5 ? "SHUTTING" : "UNKNOWN_STATUS"))))));
+                }
+
+                if (status.has_newevent())
+                {
+                    int e = status.newevent();
+                    printf(" evnt=%d %s", e,
+                            (e == 1 ? "CLOSING_LEDGER" :
+                             (e == 2 ? "ACCEPTED_LEDGER" :
+                              (e == 3 ? "SWITCHED_LEDGER" :
+                               (e == 4 ? "LOST_SYNC" : "UNKNOWN_EVENT")))));
+                }
+
+                if (status.has_ledgerseq())
+                    printf(" seq=%d", status.ledgerseq());
+
+                if (status.has_ledgerhash())
+                {
+                    uint8_t* ledger_hash = (uint8_t*)(status.ledgerhash().c_str());    
+                    printf(" hash=");
+                    for (int i = 0; i < 32; ++i)
+                        printf("%02X", ledger_hash[i]);
+                }
+
+                if (status.has_ledgerhashprevious())
+                {
+                    uint8_t* prev_hash = (uint8_t*)(status.ledgerhashprevious().c_str());    
+                    printf(" prev=");
+                    for (int i = 0; i < 32; ++i)
+                        printf("%02X", prev_hash[i]);
+                }
+
+/*
+
+message TMStatusChange
+{
+    optional NodeStatus newStatus       = 1;
+    optional NodeEvent newEvent         = 2;
+    optional uint32 ledgerSeq           = 3;
+    optional bytes ledgerHash           = 4;
+    optional bytes ledgerHashPrevious   = 5;
+    optional uint64 networkTime         = 6;
+    optional uint32 firstSeq            = 7;
+    optional uint32 lastSeq             = 8;
+}
+*/
+
+                if (status.has_networktime())
+                    printf(" time=%llu", status.networktime());
+
+                if (status.has_firstseq())
+                    printf(" fseq=%lu", status.firstseq());
+
+                if (status.has_lastseq())
+                    printf(" lseq=%lu", status.lastseq());
+
+                printf("\n");
                 break;
             }
             case 35: // mtHAVE_SET
@@ -756,7 +847,8 @@ void process_packet(
         printf("Quiting due to manifests-only flag\n");
         exit(0);
     }
-    
+   
+    fflush(stdout); 
 
 }
 
