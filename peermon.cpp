@@ -1,5 +1,5 @@
 
-#define VERSION "1.3"
+#define VERSION "1.31"
 #include <sodium.h>
 
 #include <iostream>
@@ -46,6 +46,13 @@
 #define PACKET_STACK_BUFFER_SIZE 2048
 //#define PACKET_STACK_BUFFER_SIZE 10
 
+#define TLS_LISTEN_CERT "listen.cert" 
+#define TLS_LISTEN_KEY "listen.key"
+void print_cert_help_then_exit()
+{
+    fprintf(stderr, "openssl req  -nodes -new -x509  -keyout %s -out %s\n", TLS_LISTEN_KEY, TLS_LISTEN_CERT);
+    exit(1);
+}
 
 std::string peer;
 time_t time_start;
@@ -121,7 +128,7 @@ int printd(Args ... args)
     return 1;
 }
 
-int connect_peer(std::string_view ip_port)
+int connect_peer(std::string_view ip_port, int listen_mode)
 {
 
     auto x = ip_port.find_last_of(":");
@@ -148,8 +155,48 @@ int connect_peer(std::string_view ip_port)
     if(inet_pton(AF_INET, ip.c_str(), &serv_addr.sin_addr)<=0)
         return printd("[DBG] Could not create socket for ", ip_port," inet_pton error occured"), -1;
 
-    if( connect(sockfd, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0)
-        return printd("[DBG] Could not connect to ", ip_port), -1;
+    if (listen_mode)
+    {
+        if (access(TLS_LISTEN_CERT, F_OK) != 0)
+        {
+            fprintf(stderr, "Could not open ./%s\nTry: ", TLS_LISTEN_CERT);
+            print_cert_help_then_exit();
+        }
+
+        if (access(TLS_LISTEN_KEY, F_OK) != 0)
+        {
+            return fprintf(stderr, "Could not open ./%s\nTry: ", TLS_LISTEN_KEY);
+            print_cert_help_then_exit();
+        }
+
+        if (bind(sockfd, (struct sockaddr *)&serv_addr , sizeof(serv_addr)) < 0)
+            return fprintf(stderr, "Could not bind to ip and port\n");
+
+        if (listen(sockfd, 1) < 0)
+            return fprintf(stderr, "Could not listen on ip and port\n");
+
+        printf("Waiting for an incoming connection on %s %d\n", ip.c_str(), port);
+        struct sockaddr client_addr;
+        int address_len = sizeof(client_addr);
+        sockfd = accept(sockfd, &client_addr, &address_len);
+
+        struct sockaddr_in* pV4Addr = (struct sockaddr_in*)&client_addr;
+        struct in_addr ipAddr = pV4Addr->sin_addr;
+        char str[INET_ADDRSTRLEN];
+        for (int i = 0; i < INET_ADDRSTRLEN; ++i)
+            str[0] = 0;
+
+        inet_ntop( AF_INET, &ipAddr, str, INET_ADDRSTRLEN );
+
+        printf("Received connection from: %s\n", str);
+
+        // fall through
+    }
+    else
+    {
+        if(connect(sockfd, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0)
+            return fprintf(stderr, "Could not connect to ip and port\n");
+    }
 
     return sockfd;
 }
@@ -243,27 +290,57 @@ int generate_node_keys(
     outnodekeyb58[*outnodekeyb58size] = '\0';
 
 }
-
 //todo: clean up and optimise, check for overrun 
-SSL* ssl_handshake_and_upgrade(secp256k1_context* secp256k1ctx, int fd, SSL_CTX** outctx)
+SSL* ssl_handshake_and_upgrade(secp256k1_context* secp256k1ctx, int fd, SSL_CTX** outctx, int listen_mode)
 {
-    const SSL_METHOD *method = TLS_client_method(); 
+    const SSL_METHOD *method = 
+        listen_mode ? SSLv23_server_method() : TLS_client_method(); 
+
     SSL_CTX *ctx = SSL_CTX_new(method);
+    SSL_CTX_set_ecdh_auto(ctx, 1);
+    SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, NULL);
+
+    if (listen_mode)
+    {
+        if (access(TLS_LISTEN_CERT, F_OK) != 0 ||
+                SSL_CTX_use_certificate_file(ctx, TLS_LISTEN_CERT, SSL_FILETYPE_PEM) <= 0)
+        {
+            ERR_print_errors_fp(stderr);
+            fprintf(stderr, "Could not open ./%s\n Try: ", TLS_LISTEN_CERT);
+            print_cert_help_then_exit();
+        }
+        if (access(TLS_LISTEN_KEY, F_OK) != 0 ||
+                SSL_CTX_use_PrivateKey_file(ctx, TLS_LISTEN_KEY, SSL_FILETYPE_PEM) <= 0)
+        {
+            ERR_print_errors_fp(stderr);
+            fprintf(stderr, "Could not open ./%s\nTry: ", TLS_LISTEN_KEY);
+            print_cert_help_then_exit();
+        }        
+    }
 
     *outctx = ctx;
 
     SSL* ssl = SSL_new(ctx);
     SSL_set_fd(ssl, fd); 
 
-    int status = SSL_connect(ssl);
-    if ( status != 1 ) {
+
+    int status = -100;
+    if (listen_mode)
+        status = SSL_accept(ssl);
+    else
+        status = SSL_connect(ssl);
+
+    if (status != 1)
+    {
+        status = SSL_get_error(ssl, status);
         fprintf(stderr, "[FATAL] SSL_connect failed with SSL_get_error code %d\n", status);
         return NULL;
     }    
 
     unsigned char buffer[1024];
     size_t len = SSL_get_finished(ssl, buffer, 1024);
-    if (len < 12) {
+    if (len < 12)
+    {
         fprintf(stderr, "[FATAL] Could not SSL_get_finished\n");
         return NULL;
     }
@@ -305,26 +382,126 @@ SSL* ssl_handshake_and_upgrade(secp256k1_context* secp256k1ctx, int fd, SSL_CTX*
     char buf2[200];
     size_t buflen2 = 200;
     sodium_bin2base64(buf2, buflen2, buf, buflen, sodium_base64_VARIANT_ORIGINAL);
-
     buf2[buflen2] = '\0';
 
+
     char buf3[2048];
-    size_t buf3len = snprintf(buf3, 2047, 
-            "GET / HTTP/1.1\r\n"
-            "User-Agent: rippled-1.8.0\r\n"
-            "Upgrade: RTXP/1.2\r\n"
+    size_t buf3len = 0;
+    if (listen_mode)
+    {
+        //  we could read their incoming request first, but it probably doesn't matter full duplex ftw
+
+
+        unsigned char buffer[PACKET_STACK_BUFFER_SIZE];
+        size_t bufferlen = PACKET_STACK_BUFFER_SIZE;
+
+        bufferlen = SSL_read(ssl, buffer, PACKET_STACK_BUFFER_SIZE); 
+        if (bufferlen == 0)
+        {
+            fprintf(stderr, "Server stopped responding while we waited for upgrade request\n");
+            exit(1);
+        }
+
+        buffer[bufferlen] = '\0';
+        if (!no_http)
+            printf("Received:\n%s", buffer);
+        
+        char* default_protocol = "RTXP/1.2";
+        char* protocol = default_protocol;
+
+
+        // hacky way to grab which protocol to upgrade to, RH TODO: make this sensible
+        int find_comma = 0;
+        for (int i = 0; i < bufferlen - 10; ++i) //`Upgrade: `
+        {
+            if (find_comma && (buffer[i] == ',' || buffer[i] == '\r'))
+            {
+                buffer[i] = '\0';
+                break;
+            }
+            if (!find_comma && memcmp(buffer + i, "Upgrade: ", 9) == 0)
+            {
+                protocol = buffer + i + 9;
+                find_comma = 1;
+            }
+        }
+        
+
+        buf3len = snprintf(buf3, 2047,
+            "HTTP/1.1 101 Switching Protocols\r\n"
             "Connection: Upgrade\r\n"
+            "Upgrade: %s\r\n"
             "Connect-As: Peer\r\n"
+            "Server: rippled-1.8.0\r\n"
             "Crawl: private\r\n"
-            "Session-Signature: %s\r\n"
-            "Public-Key: %s\r\n\r\n", buf2, b58);
+            "Public-Key: %s\r\n"
+            "Session-Signature: %s\r\n\r\n", protocol, b58, buf2);
+
+    }
+    else
+    {
+        buf3len = snprintf(buf3, 2047, 
+                "GET / HTTP/1.1\r\n"
+                "User-Agent: rippled-1.8.0\r\n"
+                "Upgrade: RTXP/1.2\r\n"
+                "Connection: Upgrade\r\n"
+                "Connect-As: Peer\r\n"
+                "Crawl: private\r\n"
+                "Session-Signature: %s\r\n"
+                "Public-Key: %s\r\n\r\n", buf2, b58);
+
+    }
 
     if (!no_http)
-        printf("To write:\n%s", buf3);
+        printf("Sending:\n%s", buf3);
 
     if (SSL_write(ssl, buf3, buf3len) <= 0) {
         fprintf(stderr, "[FATAL] Failed to write bytes to openssl fd\n");
         return NULL;
+    }
+
+    if (listen_mode)
+    {
+        // send a ping immediately after handshake
+
+        /*
+message TMPing
+{
+    enum pingType {
+        ptPING = 0; // we want a reply
+        ptPONG = 1; // this is a reply
+    }
+    required pingType type      = 1;
+    optional uint32 seq         = 2; // detect stale replies, ensure other side is reading
+    optional uint64 pingTime    = 3; // know when we think we sent the ping
+    optional uint64 netTime     = 4;
+}
+
+*/
+        uint8_t packet_buffer[512];
+        int packet_len = sizeof(packet_buffer);
+
+        protocol::TMPing ping;
+        printf("%lu mtPING - sending out\n");
+        ping.set_type(protocol::TMPing_pingType_ptPING);
+
+        //unsigned char* buf = (unsigned char*) malloc(ping.ByteSizeLong());
+        ping.SerializeToArray(packet_buffer, packet_len);
+
+        uint32_t reply_len = packet_len;
+        uint16_t reply_type = 3;
+
+        // write reply header
+        unsigned char header[6];
+        header[0] = (reply_len >> 24) & 0xff;
+        header[1] = (reply_len >> 16) & 0xff;
+        header[2] = (reply_len >> 8) & 0xff;
+        header[3] = reply_len & 0xff;
+        header[4] = (reply_type >> 8) & 0xff;
+        header[5] = reply_type & 0xff;
+        SSL_write(ssl, header, 6);
+        SSL_write(ssl, packet_buffer, packet_len);
+
     }
 
     return ssl;
@@ -472,7 +649,7 @@ void process_packet(
         protocol::TMPing ping;
         bool success = ping.ParseFromArray( packet_buffer, packet_len ) ;
         if (!no_dump && display)
-         printf("parsed ping: %s\n", (success ? "yes" : "no") );
+            printf("%lu mtPING - replying PONG\n");
         ping.set_type(protocol::TMPing_pingType_ptPONG);
 
         //unsigned char* buf = (unsigned char*) malloc(ping.ByteSizeLong());
@@ -492,8 +669,6 @@ void process_packet(
         SSL_write(ssl, header, 6);
         SSL_write(ssl, packet_buffer, packet_len);
 
-        if (!no_dump && display) 
-            printf("Sent PONG\n");
         return;
     }
 
@@ -895,7 +1070,7 @@ int print_usage(int argc, char** argv, char* message)
         fprintf(stderr, "Error: %s\n", message);
     else
         fprintf(stderr, "A tool to connect to a rippled node as a peer and monitor the traffic it produces\n");
-    fprintf(stderr, "Usage: %s PEER-IP PORT [OPTIONS] [show:mtPACKET,... | hide:mtPACKET,...]\n", argv[0]);
+    fprintf(stderr, "Usage: %s IP PORT [OPTIONS] [show:mtPACKET,... | hide:mtPACKET,...]\n", argv[0]);
     fprintf(stderr, "Options:\n"
             "\tslow\t\t- Only print at most once every 5 seconds. Will skip displaying most packets. Use for stats.\n"
             "\tno-cls\t\t- Don't clear the screen between printing. If you're after packet contents use this.\n"
@@ -905,6 +1080,7 @@ int print_usage(int argc, char** argv, char* message)
             "\tmanifests-only\t- Only collect and print manifests then exit.\n"
             "\traw-hex\t\t- Print raw hex where appropriate instead of giving it line numbers and spacing.\n"
             "\tno-hex\t\t- Never print hex, only parsed / able-to-be-parsed STObjects or omit.\n"
+            "\tlisten\t\t- experimental do not use.\n"
             );
     fprintf(stderr, "Show / Hide:\n"
             "\tshow:mtPACKET[,mtPACKET...]\t\t- Show only the packets in the comma seperated list (no spaces!)\n"
@@ -939,6 +1115,8 @@ int main(int argc, char** argv)
 
     int port = 0;
 
+    int listen_mode = 0;
+
     if (sscanf(argv[2], "%lu", &port) != 1)
         return print_usage(argc, argv, "Invalid port");
 
@@ -967,6 +1145,8 @@ int main(int argc, char** argv)
         char* opt = argv[i];
         if (strcmp(opt, "no-cls") == 0)
             use_cls = 0;
+        else if (strcmp(opt, "listen") == 0)
+            listen_mode = 1;
         else if (strcmp(opt, "no-dump") == 0)
             no_dump = 1;
         else if (strcmp(opt, "no-stats") == 0)
@@ -1033,15 +1213,17 @@ int main(int argc, char** argv)
     }
 
     SSL_library_init();
-    
+   
+    SSL_load_error_strings();
+    OpenSSL_add_ssl_algorithms();
+
     secp256k1_context* secp256k1ctx = secp256k1_context_create(
                 SECP256K1_CONTEXT_VERIFY |
                 SECP256K1_CONTEXT_SIGN) ;
 
 
     int fd = -1;
-
-    fd = connect_peer(peer.c_str());
+    fd = connect_peer(peer.c_str(), listen_mode);
 
     time_start = time(NULL);
 
@@ -1052,7 +1234,7 @@ int main(int argc, char** argv)
 
     SSL_CTX* sslctx = NULL;
 
-    SSL* ssl = ssl_handshake_and_upgrade(secp256k1ctx, fd, &sslctx);
+    SSL* ssl = ssl_handshake_and_upgrade(secp256k1ctx, fd, &sslctx, listen_mode);
 
     if (ssl == NULL) {
         fprintf(stderr, "[FATAL] Could not handshake\n");
@@ -1062,11 +1244,13 @@ int main(int argc, char** argv)
     unsigned char buffer[PACKET_STACK_BUFFER_SIZE];
     size_t bufferlen = PACKET_STACK_BUFFER_SIZE;
 
-    int pc = 0;
+    int pc = (listen_mode ? 1 : 0);
     while (fd_valid(fd)) {
         bufferlen = SSL_read(ssl, buffer, (pc == 0 ? PACKET_STACK_BUFFER_SIZE : 10)); 
         if (bufferlen == 0)
         {
+            int status = SSL_get_error(ssl, bufferlen);
+            fprintf(stderr, "SSL_get_error code %d\n", status);
             fprintf(stderr, "Server stopped responding\n");
             break;
         }
@@ -1074,7 +1258,7 @@ int main(int argc, char** argv)
         buffer[bufferlen] = '\0';
         if (!pc) {
             if (!no_http)
-                printf("Returned:\n%s", buffer);
+                printf("Received:\n%s", buffer);
 
             if (bufferlen >= sizeof("HTTP/1.1 503 Service Unavailable")-1 &&
                 memcmp(buffer, "HTTP/1.1 503 Service Unavailable", sizeof("HTTP/1.1 503 Service Unavailable")-1) == 0)
