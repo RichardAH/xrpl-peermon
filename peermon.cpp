@@ -1,5 +1,5 @@
 
-#define VERSION "1.2"
+#define VERSION "1.3"
 #include <sodium.h>
 
 #include <iostream>
@@ -572,8 +572,44 @@ void process_packet(
             {
                 break;
             }
+/*
+message TMProposeSet                                                                                                   
+{                                                                                                                      
+    required uint32 proposeSeq          = 1;                                                                           
+    required bytes currentTxHash        = 2;    // the hash of the ledger we are proposing                             
+    required bytes nodePubKey           = 3;                                                                           
+    required uint32 closeTime           = 4;                                                                           
+    required bytes signature            = 5;    // signature of above fields                                           
+    required bytes previousledger       = 6;                                                                           
+    repeated bytes addedTransactions    = 10;   // not required if number is large                                     
+    repeated bytes removedTransactions  = 11;   // not required if number is large                                     
+                                                                                                                       
+    // node vouches signature is correct                                                                               
+    optional bool checkedSignature      = 7     [deprecated=true];                                                     
+                                                                                                                       
+    // Number of hops traveled                                                                                         
+    optional uint32 hops                = 12    [deprecated=true];                                                     
+}     
+*/
+//1636450323 mtPROPOSE_LEDGER seq=0 set= ctime=6897655230000000000000000000000000000000000000000000000000000000000000000 pub=034E305DEEEF38A71F800EB48D80F8FDA50D3948E8BBD60C7D802A7CDD707FC286
             case 33: // mtPROPOSE_LEDGER
             {
+                protocol::TMProposeSet ps;
+                bool success = ps.ParseFromArray( packet_buffer, packet_len );
+                uint8_t* set_hash = (uint8_t*)(ps.currenttxhash().c_str());
+                uint8_t* node_pub = (uint8_t*)(ps.nodepubkey().c_str());
+                printf("%llu mtPROPOSE_LEDGER seq=%lu set=", time(NULL), ps.proposeseq());
+                for (int i = 0 ; i < 32; ++i)
+                    printf("%02X", set_hash[i]);
+
+                printf(" pub=");
+                for (int i = 0; i < ps.nodepubkey().size(); ++i)
+                    printf("%02X", node_pub[i]);
+
+                printf(" ctime=%lu", ps.closetime());
+                printf("\n");
+
+
                 break;
             }
             case 34: // mtSTATUS_CHANGE
