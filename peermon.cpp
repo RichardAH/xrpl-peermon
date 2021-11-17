@@ -443,7 +443,7 @@ SSL* ssl_handshake_and_upgrade(secp256k1_context* secp256k1ctx, int fd, SSL_CTX*
         buf3len = snprintf(buf3, 2047, 
                 "GET / HTTP/1.1\r\n"
                 "User-Agent: rippled-1.8.0\r\n"
-                "Upgrade: RTXP/1.2\r\n"
+                "Upgrade: XRPL/2.0\r\n"
                 "Connection: Upgrade\r\n"
                 "Connect-As: Peer\r\n"
                 "Crawl: private\r\n"
