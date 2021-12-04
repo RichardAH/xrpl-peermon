@@ -15,51 +15,57 @@ make
 Usage:
 
 ```
-./peermon PEER-IP PORT [OPTIONS]
+XRPL Peer Monitor
+Version: 1.31
+Richard Holland / XRPL-Labs
+A tool to connect to a rippled node as a peer and monitor the traffic it produces
+Usage: ./peermon IP PORT [OPTIONS] [show:mtPACKET,... | hide:mtPACKET,...]
 Options:
-        no-cls          - Don't clear the screen between printing stats.
-        no-dump         - Don't dump the latest packet contents.
-        slow            - Only print at most once every 5 seconds.
+        slow            - Only print at most once every 5 seconds. Will skip displaying most packets. Use for stats.
+        no-cls          - Don't clear the screen between printing. If you're after packet contents use this.
+        no-dump         - Don't dump any packet contents.
+        no-stats        - Don't produce stats.
+        no-http         - Don't output HTTP upgrade.
         manifests-only  - Only collect and print manifests then exit.
-        raw             - Print raw hex where appropriate instead of giving it line numbers and spacing.
+        raw-hex         - Print raw hex where appropriate instead of giving it line numbers and spacing.
+        no-hex          - Never print hex, only parsed / able-to-be-parsed STObjects or omit.
+        listen          - experimental do not use.
+Show / Hide:
+        show:mtPACKET[,mtPACKET...]             - Show only the packets in the comma seperated list (no spaces!)
+        hide:mtPACKET[,mtPACKET...]             - Show all packets except those in the comma seperated list.
+Packet Types:
+        mtMANIFESTS mtPING mtCLUSTER mtENDPOINTS mtTRANSACTION mtGET_LEDGER mtLEDGER_DATA mtPROPOSE_LEDGER
+        mtSTATUS_CHANGE mtHAVE_SET mtVALIDATION mtGET_OBJECTS mtGET_SHARD_INFO mtSHARD_INFO mtGET_PEER_SHARD_INFO
+        mtPEER_SHARD_INFO mtVALIDATORLIST mtSQUELCH mtVALIDATORLISTCOLLECTION mtPROOF_PATH_REQ mtPROOF_PATH_RESPONSE
+        mtREPLAY_DELTA_REQ mtREPLAY_DELTA_RESPONSE mtGET_PEER_SHARD_INFO_V2 mtPEER_SHARD_INFO_V2 mtHAVE_TRANSACTIONS
+        mtTRANSACTIONS
+Keys:
+        When connecting, peermon choses a random secp256k1 node key for itself.
+        If this is not the behaviour you want please place a binary 32 byte key file at ~/.peermon.
 ```
 
 Example:
-
 ```
-./peermon r.ripple.com 51235
+        ./peermon zaphod.alloy.ee 51235 no-dump                                    # display realtime stats for this node
+        ./peermon zaphod.alloy.ee 51235 no-cls no-stats show:mtGET_LEDGER          # show only the GET_LEDGER packets
 ```
 
 # Output
 ```
-XRPL-Peermon
-Connected to Peer: 34.205.233.231:51235 for 6 sec
+XRPL-Peermon -- Connected to Peer: --:51235 for 7 sec
 
-Packet                    Total               Per second          Total Bytes         Data rate       
+Packet                    Total               Per second          Total Bytes         Data rate
 ------------------------------------------------------------------------------------------------------
-mtMANIFESTS               2                   0.333333            186.29 K            31.05 K/s
-mtTRANSACTION             112                 18.6667             25.14 K             4.19 K/s
-mtPROPOSE_LEDGER          90                  15                  16.13 K             2.69 K/s
-mtSTATUS_CHANGE           4                   0.666667            364.00 B            60.67 B/s
-mtHAVE_SET                22                  3.66667             792.00 B            132.00 B/s
-mtVALIDATION              285                 47.5                64.25 K             10.71 K/s
-mtGET_PEER_SHARD_INFO     1                   0.166667            2.00 B              0.33 B/s
+mtMANIFESTS               1                   0.142857            195.07 K            27.87 K/s
+mtTRANSACTION             166                 23.7143             35.39 K             5.06 K/s
+mtPROPOSE_LEDGER          104                 14.8571             18.63 K             2.66 K/s
+mtSTATUS_CHANGE           3                   0.428571            273.00 B            39.00 B/s
+mtHAVE_SET                57                  8.14286             2.00 K              293.14 B/s
+mtVALIDATION              245                 35                  55.25 K             7.89 K/s
+mtGET_PEER_SHARD_INFO_V2  1                   0.142857            2.00 B              0.29 B/s
 ------------------------------------------------------------------------------------------------------
-Totals                    516                 86                  292.96 K            48.83 K/s
+Totals                    577                 82.4286             306.61 K            43.80 K/s
 
 
 Latest packet: mtVALIDATION [41] -- 236 bytes
-parsed validation: yes
-stvalidation data: 2280000001260404FAE8292913E3C83A9DFC8E9E5ABBFB9A51FB214934575298D71081553C61331A2406F7931D21B1588263CE641D8C1B16C250176967A69444C1ACBD7DF1EBE115C17A61CB01CB4A7FBD3E3F21EE33EE02653E395019F5CC91CF06D8431B8627A2C3B82F11AD17DD8246F5774140186901E02DED6B037321038D4BA061B8E1DF5366A4F46DA92BF5DA450AA2FE7E05C220D9806027977F869C76473045022100F95C0B19112AE6BB169E9409791A87D4BECBBAEFF964A25D8007CF71EDF599B2022049A3716D3F90BC322DB4BCCF29540FD04F3EB88AC37A77B66EAC75B963337AC9
-{
-	"Flags": 2147483649,
-	"LedgerSequence": 67435240,
-	"SigningTime": 689169352,
-	"Cookie": 113841307688640,
-	"LedgerHash": "FB214934575298D71081553C61331A2406F7931D21B1588263CE641D8C1B16C2",
-	"ConsensusHash": "6967A69444C1ACBD7DF1EBE115C17A61CB01CB4A7FBD3E3F21EE33EE02653E39",
-	"ValidatedHash": "F5CC91CF06D8431B8627A2C3B82F11AD17DD8246F5774140186901E02DED6B03",
-	"SigningPubKey": "038D4BA061B8E1DF5366A4F46DA92BF5DA450AA2FE7E05C220D9806027977F869C",
-	"Signature": 
-}
 ```
