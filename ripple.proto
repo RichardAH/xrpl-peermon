@@ -33,6 +33,7 @@ enum MessageType
     mtPEER_SHARD_INFO_V2        = 62;
     mtHAVE_TRANSACTIONS         = 63;
     mtTRANSACTIONS              = 64;
+    mtRESOURCE_REPORT           = 65;
 }
 
 // token, iterations, target, challenge = issue demand for proof of work
@@ -450,3 +451,21 @@ message TMHaveTransactions
     repeated bytes hashes = 1;
 }
 
+/*
+enum TMResourceReportEntryType
+{
+    rrCpuUsage = 1;
+    rrServerLoad = 2;
+    rrRippledMemUsed = 3;
+    rrSystemMemFree = 4;
+    rrRippledUptime = 5;
+    rrSystemUptime = 6;
+}
+*/
+
+message TMResourceReport
+{
+    // required TMClusterNode clusterNode = 1;
+    required string nodeName = 1;
+    map<string, string> resourceReportMap = 2;
+}
