@@ -541,6 +541,7 @@ const char* packet_name(
         case 62: return (padded ? "mtPEER_SHARD_INFO_V2      " : "mtPEER_SHARD_INFO_V2");
         case 63: return (padded ? "mtHAVE_TRANSACTIONS       " : "mtHAVE_TRANSACTIONS");
         case 64: return (padded ? "mtTRANSACTIONS            " : "mtTRANSACTIONS");        
+        case 65: return (padded ? "mtRESOURCE_REPORT         " : "mtRESOURCE_REPORT");
         default: return (padded ? "mtUNKNOWN_PACKET          " : mtUNKNOWN);
     }
 }
@@ -575,6 +576,7 @@ int32_t packet_id(char* packet_name)
     if (stricmp("mtPEER_SHARD_INFO_V2", packet_name) == 0) return 62;
     if (stricmp("mtHAVE_TRANSACTIONS", packet_name) == 0) return 63;
     if (stricmp("mtTRANSACTIONS", packet_name) == 0) return 64;
+    if (stricmp("mtRESOURCE_REPORT", packet_name) == 0) return 65;
     return -1;
 }
 
@@ -962,6 +964,13 @@ message TMStatusChange
             {
                 break;
             }
+            case 65: // mtRESOURCE_REPORT
+            {
+                protocol::TMResourceReport report;
+                bool success = report.ParseFromArray( packet_buffer, packet_len );
+                printf("%d mtRESOURCE_REPORT: %s\n", time(NULL), (success ? report.DebugString().data() : "<error parsing>"));
+                break;
+            }
             default:
             {
                 printf("mtUnknown [%d] size = %d, %s (print capped at 128):\n", packet_type, packet_len,
@@ -1091,7 +1100,7 @@ int print_usage(int argc, char** argv, char* message)
     "\tmtSTATUS_CHANGE mtHAVE_SET mtVALIDATION mtGET_OBJECTS mtGET_SHARD_INFO mtSHARD_INFO mtGET_PEER_SHARD_INFO\n"
     "\tmtPEER_SHARD_INFO mtVALIDATORLIST mtSQUELCH mtVALIDATORLISTCOLLECTION mtPROOF_PATH_REQ mtPROOF_PATH_RESPONSE\n"
     "\tmtREPLAY_DELTA_REQ mtREPLAY_DELTA_RESPONSE mtGET_PEER_SHARD_INFO_V2 mtPEER_SHARD_INFO_V2 mtHAVE_TRANSACTIONS\n"
-    "\tmtTRANSACTIONS\n");
+    "\tmtTRANSACTIONS\tmtRESOURCE_REPORT\n");
     fprintf(stderr, "Keys:\n"
             "\tWhen connecting, peermon choses a random secp256k1 node key for itself.\n"
             "\tIf this is not the behaviour you want please place a binary 32 byte key file at ~/.peermon.\n");
