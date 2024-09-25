@@ -77,8 +77,8 @@ bool calc_sha_256(void* hash_raw, const void * input, size_t len)
 	uint8_t processed_chunk[CHUNK_SIZE];
 
 	/* Process the message and additional appended bytes in successive 512-bit chunks */
-	const uint8_t *input_end = (uint8_t *) input + len;
-	for (const uint8_t *chunk = input; chunk < input_end + 1 + INT64_SIZE; chunk += CHUNK_SIZE) {
+	const uint8_t *input_end = (uint8_t const*) input + len;
+	for (const uint8_t *chunk = (uint8_t const*)input; chunk < input_end + 1 + INT64_SIZE; chunk += CHUNK_SIZE) {
 		const uint8_t *p;
 
 		if (chunk + CHUNK_SIZE <= input_end) {

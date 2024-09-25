@@ -25,8 +25,9 @@ extern "C" {
 
 #define DEBUG 0
 
-int append(int indent_level, uint8_t** output, int* upto, int* len, int write_fd, uint8_t* append, int append_len)
+int append(int indent_level, uint8_t** output, int* upto, int* len, int write_fd, void const* append_raw, int append_len)
 {
+    uint8_t* append = (uint8_t*)append_raw;
 
     if (DEBUG)
         printf("append: `%s`\n", append);
@@ -39,7 +40,7 @@ int append(int indent_level, uint8_t** output, int* upto, int* len, int write_fd
             if (write(write_fd, tab, 1) <= 0)
                 return 0;
        
-        int l = strnlen(append, append_len); 
+        int l = strnlen(reinterpret_cast<char const*>(append), append_len); 
         if (write(write_fd, append, l) < l)
             return 0;
 
@@ -49,7 +50,7 @@ int append(int indent_level, uint8_t** output, int* upto, int* len, int write_fd
     if (*len - *upto < append_len + 1 + indent_level)
     {
         *len *= 2;
-        *output = realloc(*output, *len + 1);
+        *output = (uint8_t*)realloc(*output, *len + 1);
         if (*output == 0)
             return 0;
     }
@@ -126,8 +127,8 @@ int append(int indent_level, uint8_t** output, int* upto, int* len, int write_fd
 
 #define HEX(out_raw, in_raw, len_raw)\
 {\
-    uint8_t* out = (out_raw);\
-    uint8_t* in = (in_raw);\
+    uint8_t* out = (uint8_t*)(out_raw);\
+    uint8_t* in = (uint8_t*)(in_raw);\
     uint64_t len = (len_raw);\
     for (int i = 0; i < len; ++i)\
     {\
@@ -248,14 +249,14 @@ int deserialize(
             return 1;
         }
         input_len = DEFAULT_SIZE;
-        input = malloc(DEFAULT_SIZE);
+        input = (uint8_t*)malloc(DEFAULT_SIZE);
         remaining = (*fetch_data_func)(input, input_len, 1, read_fd);
     }
 
     int len = DEFAULT_SIZE;
     if (output)
     {
-        *output = malloc(len);
+        *output = (uint8_t*)malloc(len);
     }
     int upto = 0;
 
@@ -660,7 +661,7 @@ int deserialize(
 
                     REQUIRE(20);
                     char currency[41];
-                    uint64_t* c = (void*)(n);
+                    uint64_t* c = (uint64_t*)(n);
 
                     if (!c[0] && !c[1] && !*((uint32_t*)(n + 16)))
                     {
@@ -878,7 +879,7 @@ int deserialize(
                 issuer[0] = 'r';
                 char currency[41];
                 currency[40] = '\0'; 
-                uint64_t* c = (void*)(n + 8);
+                uint64_t* c = (uint64_t*)(n + 8);
                 if (!c[0] && !c[1] && !*((uint32_t*)(n + 8 + 16)))
                 {
                     currency[0] = 'X';

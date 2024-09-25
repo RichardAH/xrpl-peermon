@@ -1,4 +1,3 @@
-
 #define VERSION "1.31"
 #include <sodium.h>
 
@@ -54,6 +53,19 @@ void print_cert_help_then_exit()
     exit(1);
 }
 
+int stricmp(const char *a, const char *b)
+{
+  int ca, cb;
+  do {
+     ca = (unsigned char) *a++;
+     cb = (unsigned char) *b++;
+     ca = tolower(toupper(ca));
+     cb = tolower(toupper(cb));
+   } while (ca == cb && ca != '\0');
+   return ca - cb;
+}
+
+
 std::string peer;
 time_t time_start;
 
@@ -88,7 +100,7 @@ int strnicmp(const uint8_t* a, const uint8_t* b, int n)
 void print_sto(const std::string& st)
 {
     // hacky way to add \0 to the end due to bug in deserializer
-    uint8_t* input = malloc(st.size() + 1);
+    uint8_t* input = (uint8_t*)malloc(st.size() + 1);
     int i = 0;
     for (unsigned char c : st)
         input[i++] = c;
@@ -96,14 +108,18 @@ void print_sto(const std::string& st)
 
     uint8_t* output = 0;
     if (!deserialize(&output, input, st.size() + 1, 0, 0, 0))
-        return fprintf(stderr, "Could not deserialize\n");
+    {
+        fprintf(stderr, "Could not deserialize\n");
+        return;
+    }
     printf("%s\n", output);
     free(output);
     free(input);
 }
 
-void print_hex(uint8_t* packet_buffer, int packet_len)
+void print_hex(void const* packet_buffer_raw, int packet_len)
 {
+    uint8_t* packet_buffer = (uint8_t*)packet_buffer_raw;
     if (no_hex)
         return;
 
@@ -177,8 +193,8 @@ int connect_peer(std::string_view ip_port, int listen_mode)
 
         printf("Waiting for an incoming connection on %s %d\n", ip.c_str(), port);
         struct sockaddr client_addr;
-        int address_len = sizeof(client_addr);
-        sockfd = accept(sockfd, &client_addr, &address_len);
+        unsigned int address_len = sizeof(client_addr);
+        sockfd = accept(sockfd, (struct sockaddr*)&client_addr, &address_len);
 
         struct sockaddr_in* pV4Addr = (struct sockaddr_in*)&client_addr;
         struct in_addr ipAddr = pV4Addr->sin_addr;
@@ -287,8 +303,10 @@ int generate_node_keys(
     // generate base58 encoding
     b58enc(outnodekeyb58, outnodekeyb58size, outpubcompressed38, 38);
 
-    outnodekeyb58[*outnodekeyb58size] = '\0';
+    uint8_t* fin = (uint8_t*)outnodekeyb58 + (*outnodekeyb58size);
+    *fin = '\0';
 
+    return 1;
 }
 //todo: clean up and optimise, check for overrun 
 SSL* ssl_handshake_and_upgrade(secp256k1_context* secp256k1ctx, int fd, SSL_CTX** outctx, int listen_mode)
@@ -406,8 +424,8 @@ SSL* ssl_handshake_and_upgrade(secp256k1_context* secp256k1ctx, int fd, SSL_CTX*
         if (!no_http)
             printf("Received:\n%s", buffer);
         
-        char* default_protocol = "RTXP/1.2";
-        char* protocol = default_protocol;
+        uint8_t* default_protocol = (uint8_t*)"XRPL/2.1";
+        uint8_t* protocol = default_protocol;
 
 
         // hacky way to grab which protocol to upgrade to, RH TODO: make this sensible
@@ -432,7 +450,7 @@ SSL* ssl_handshake_and_upgrade(secp256k1_context* secp256k1ctx, int fd, SSL_CTX*
             "Connection: Upgrade\r\n"
             "Upgrade: %s\r\n"
             "Connect-As: Peer\r\n"
-            "Server: rippled-1.8.0\r\n"
+            "Server: rippled-2.2.2\r\n"
             "Crawl: private\r\n"
             "Public-Key: %s\r\n"
             "Session-Signature: %s\r\n\r\n", protocol, b58, buf2);
@@ -442,8 +460,8 @@ SSL* ssl_handshake_and_upgrade(secp256k1_context* secp256k1ctx, int fd, SSL_CTX*
     {
         buf3len = snprintf(buf3, 2047, 
                 "GET / HTTP/1.1\r\n"
-                "User-Agent: rippled-1.8.0\r\n"
-                "Upgrade: XRPL/2.0\r\n"
+                "User-Agent: rippled-2.2.2\r\n"
+                "Upgrade: XRPL/2.1\r\n"
                 "Connection: Upgrade\r\n"
                 "Connect-As: Peer\r\n"
                 "Crawl: private\r\n"
@@ -482,7 +500,7 @@ message TMPing
         int packet_len = sizeof(packet_buffer);
 
         protocol::TMPing ping;
-        printf("%lu mtPING - sending out\n");
+        printf("%u mtPING - sending out\n");
         ping.set_type(protocol::TMPing_pingType_ptPING);
 
         //unsigned char* buf = (unsigned char*) malloc(ping.ByteSizeLong());
@@ -651,7 +669,7 @@ void process_packet(
         protocol::TMPing ping;
         bool success = ping.ParseFromArray( packet_buffer, packet_len ) ;
         if (!no_dump && display)
-            printf("%lu mtPING - replying PONG\n");
+            printf("%u mtPING - replying PONG\n");
         ping.set_type(protocol::TMPing_pingType_ptPONG);
 
         //unsigned char* buf = (unsigned char*) malloc(ping.ByteSizeLong());
@@ -712,7 +730,7 @@ void process_packet(
             {   //rawTransaction
                 protocol::TMTransaction txn;
                 bool success = txn.ParseFromArray( packet_buffer, packet_len );
-                printf("%llu mtTRANSACTION %s\n", time(NULL), (success ? "" : "<error parsing>") );
+                printf("%lu mtTRANSACTION %s\n", time(NULL), (success ? "" : "<error parsing>") );
                 const std::string& st = txn.rawtransaction();
                 print_hex(st.c_str(), st.size());
                 if (success)
@@ -731,7 +749,7 @@ void process_packet(
                
                 uint32_t len = gl.nodeids_size();
 
-                printf("%llu mtGET_LEDGER seq=%lu hash=", time(NULL), ledger_seq);
+                printf("%lu mtGET_LEDGER seq=%u hash=", time(NULL), ledger_seq);
                 for (int i = 0; i < 32; ++i)
                     printf("%02X", ledger_hash[i]);
                 printf(" itype=%d ltype=%d\n", info_type, ledger_type);
@@ -775,7 +793,7 @@ message TMProposeSet
                 bool success = ps.ParseFromArray( packet_buffer, packet_len );
                 uint8_t* set_hash = (uint8_t*)(ps.currenttxhash().c_str());
                 uint8_t* node_pub = (uint8_t*)(ps.nodepubkey().c_str());
-                printf("%llu mtPROPOSE_LEDGER seq=%lu set=", time(NULL), ps.proposeseq());
+                printf("%lu mtPROPOSE_LEDGER seq=%u set=", time(NULL), ps.proposeseq());
                 for (int i = 0 ; i < 32; ++i)
                     printf("%02X", set_hash[i]);
 
@@ -783,7 +801,7 @@ message TMProposeSet
                 for (int i = 0; i < ps.nodepubkey().size(); ++i)
                     printf("%02X", node_pub[i]);
 
-                printf(" ctime=%lu", ps.closetime());
+                printf(" ctime=%u", ps.closetime());
                 printf("\n");
 
 
@@ -873,13 +891,13 @@ message TMStatusChange
 */
 
                 if (status.has_networktime())
-                    printf(" time=%llu", status.networktime());
+                    printf(" time=%lu", status.networktime());
 
                 if (status.has_firstseq())
-                    printf(" fseq=%lu", status.firstseq());
+                    printf(" fseq=%u", status.firstseq());
 
                 if (status.has_lastseq())
-                    printf(" lseq=%lu", status.lastseq());
+                    printf(" lseq=%u", status.lastseq());
 
                 printf("\n");
                 break;
@@ -993,7 +1011,7 @@ message TMStatusChange
         if (time_elapsed <= 0) time_elapsed = 1;
 
         printf(
-            "XRPL-Peermon -- Connected to Peer: %s for %llu sec\n\n"
+            "XRPL-Peermon -- Connected to Peer: %s for %lu sec\n\n"
             "Packet                    Total               Per second          Total Bytes         Data rate       \n"
             "------------------------------------------------------------------------------------------------------\n"
             ,peer.c_str(), time_elapsed);
@@ -1024,7 +1042,7 @@ message TMStatusChange
 
             char cou_str[64];
             cou_str[0] = '\0';
-            sprintf(cou_str, "%llu", p.first);
+            sprintf(cou_str, "%lu", p.first);
             rpad(cou_str, PAD);
 
             char cps_str[64];
@@ -1046,7 +1064,7 @@ message TMStatusChange
             
         char cou_str[64];
         cou_str[0] = '\0';
-        sprintf(cou_str, "%llu", total_packets);
+        sprintf(cou_str, "%lu", total_packets);
         rpad(cou_str, PAD);
 
         char cps_str[64];
@@ -1059,7 +1077,7 @@ message TMStatusChange
             "------------------------------------------------------------------------------------------------------\n"
             "Totals                    %s%s%s%s\n\n\n",
             cou_str, cps_str, bto_str, bps_str);
-        printf("Latest packet: %s [%d] -- %lu bytes\n", packet_name(packet_type, 0), packet_type, packet_len);
+        printf("Latest packet: %s [%d] -- %u bytes\n", packet_name(packet_type, 0), packet_type, packet_len);
     }
 
     if (manifests_only && packet_type != 2)
@@ -1122,16 +1140,17 @@ int main(int argc, char** argv)
     if (argc < 3)
         return print_usage(argc, argv, NULL);
 
-    int port = 0;
+    uint32_t port = 0;
 
     int listen_mode = 0;
 
-    if (sscanf(argv[2], "%lu", &port) != 1)
+    if (sscanf(argv[2], "%u", &port) != 1)
         return print_usage(argc, argv, "Invalid port");
 
     int ip[4];
     char* host = argv[1];
-    if (sscanf(host, "%lu.%lu.%lu.%lu", ip, ip+1, ip+2, ip+3) != 4)
+
+    if (sscanf(host, "%u.%u.%u.%u", ip, ip+1, ip+2, ip+3) != 4)
     {
         // try do a hostname lookup
         struct hostent* hn = gethostbyname(argv[1]);
@@ -1140,7 +1159,7 @@ int main(int argc, char** argv)
         
         struct in_addr** addr_list = (struct in_addr **)hn->h_addr_list;
         host = inet_ntoa(*addr_list[0]);
-        if (sscanf(host, "%lu.%lu.%lu.%lu", ip, ip+1, ip+2, ip+3) != 4)
+        if (sscanf(host, "%u.%u.%u.%u", ip, ip+1, ip+2, ip+3) != 4)
             return print_usage(argc, argv, "Invalid IP after resolving hostname (IPv4 ONLY)");
     }
 
