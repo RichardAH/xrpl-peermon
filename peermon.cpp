@@ -1,10 +1,11 @@
-#define VERSION "1.31"
+#define VERSION "1.40"
 #include <sodium.h>
 
 #include <iostream>
 #include <string_view>
 #include <string>
 #include <string.h>
+#include <strings.h>
 #include <time.h>
 
 #include <sys/socket.h>
@@ -73,6 +74,115 @@ time_t time_start;
 
 // these are defaults set at startup according to cmdline flags
 int use_cls = 1, no_dump = 0, slow = 0, manifests_only = 0, raw_hex = 0, no_stats = 0, no_http = 0, no_hex = 0;
+
+// Network selection.
+// Xahau (xahaud) treats a missing Network-ID handshake header as network 0 and
+// refuses the connection, so it must be sent for Xahau. rippled only checks it
+// when present. By default nothing is sent, as before (XRPL mainnet).
+#define XAHAU_MAINNET_NETWORK_ID 21337
+long network_id = -1;           // -1 = don't send a Network-ID header
+int use_xahau_defs = 0;         // decode STObjects with Xahau's field/type tables
+std::string peer_network_id;    // Network-ID header the peer sent us, if any
+std::string peer_server;        // Server / User-Agent header the peer sent us, if any
+
+// xahaud's own convention: 21330-21339 are Xahau networks (21337 main, 21338 test)
+int is_xahau_network_id(long id)
+{
+    return id >= 0 && id / 10 == 2133;
+}
+
+// Value of HTTP header `name` (case-insensitive) in a NUL-terminated head, or "".
+std::string http_header(const char* head, const char* name)
+{
+    size_t nl = strlen(name);
+    for (const char* p = strstr(head, "\r\n"); p; p = strstr(p, "\r\n"))
+    {
+        p += 2;
+        if (strncasecmp(p, name, nl) == 0 && p[nl] == ':')
+        {
+            const char* v = p + nl + 1;
+            while (*v == ' ' || *v == '\t')
+                ++v;
+            const char* e = v;
+            while (*e && *e != '\r' && *e != '\n')
+                ++e;
+            return std::string(v, e - v);
+        }
+    }
+    return "";
+}
+
+// Bytes already read from the TLS stream that belong to the peer protocol
+// (i.e. anything received after the end of the HTTP upgrade head).
+uint8_t pending[8192];
+size_t pending_len = 0, pending_off = 0;
+
+// Read exactly n bytes from the peer. Returns 1 on success, 0 on disconnect.
+int read_exact(SSL* ssl, uint8_t* out, size_t n)
+{
+    size_t got = 0;
+    if (pending_off < pending_len)
+    {
+        size_t take = pending_len - pending_off;
+        if (take > n)
+            take = n;
+        memcpy(out, pending + pending_off, take);
+        pending_off += take;
+        got = take;
+    }
+    while (got < n)
+    {
+        int r = SSL_read(ssl, out + got, (int)(n - got > 0x40000000 ? 0x40000000 : n - got));
+        if (r <= 0)
+        {
+            int status = SSL_get_error(ssl, r);
+            fprintf(stderr, "SSL_get_error code %d\n", status);
+            fprintf(stderr, "Server stopped responding\n");
+            return 0;
+        }
+        got += r;
+    }
+    return 1;
+}
+
+// Read an HTTP request/response head (up to and including the blank line)
+// into head (NUL-terminated). Any bytes after it are kept for read_exact().
+// Returns the length of the head, or -1.
+int read_http_head(SSL* ssl, char* head, size_t headsz)
+{
+    size_t hl = 0;
+    char* end = NULL;
+    while (!end)
+    {
+        if (hl >= headsz - 1)
+        {
+            fprintf(stderr, "HTTP upgrade head larger than %zu bytes\n", headsz - 1);
+            return -1;
+        }
+        int r = SSL_read(ssl, head + hl, (int)(headsz - 1 - hl));
+        if (r <= 0)
+        {
+            fprintf(stderr, "Connection closed during the HTTP upgrade (SSL_get_error code %d)\n",
+                    SSL_get_error(ssl, r));
+            return -1;
+        }
+        hl += r;
+        head[hl] = '\0';
+        end = strstr(head, "\r\n\r\n");
+    }
+    size_t head_len = (end + 4) - head;
+    size_t extra = hl - head_len;
+    if (extra > sizeof(pending))
+    {
+        fprintf(stderr, "Too much data after the HTTP upgrade head\n");
+        return -1;
+    }
+    memcpy(pending, head + head_len, extra);
+    pending_len = extra;
+    pending_off = 0;
+    head[head_len] = '\0';
+    return (int)head_len;
+}
 int stricmp(const uint8_t* a, const uint8_t* b)
 {
     int ca, cb;
@@ -186,10 +296,10 @@ int connect_peer(std::string_view ip_port, int listen_mode)
         }
 
         if (bind(sockfd, (struct sockaddr *)&serv_addr , sizeof(serv_addr)) < 0)
-            return fprintf(stderr, "Could not bind to ip and port\n");
+            return fprintf(stderr, "Could not bind to ip and port\n"), -1;
 
         if (listen(sockfd, 1) < 0)
-            return fprintf(stderr, "Could not listen on ip and port\n");
+            return fprintf(stderr, "Could not listen on ip and port\n"), -1;
 
         printf("Waiting for an incoming connection on %s %d\n", ip.c_str(), port);
         struct sockaddr client_addr;
@@ -211,7 +321,7 @@ int connect_peer(std::string_view ip_port, int listen_mode)
     else
     {
         if(connect(sockfd, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0)
-            return fprintf(stderr, "Could not connect to ip and port\n");
+            return fprintf(stderr, "Could not connect to ip and port\n"), -1;
     }
 
     return sockfd;
@@ -405,45 +515,56 @@ SSL* ssl_handshake_and_upgrade(secp256k1_context* secp256k1ctx, int fd, SSL_CTX*
 
     char buf3[2048];
     size_t buf3len = 0;
+    char network_id_header[64] = "";
     if (listen_mode)
     {
         //  we could read their incoming request first, but it probably doesn't matter full duplex ftw
-
-
-        unsigned char buffer[PACKET_STACK_BUFFER_SIZE];
-        size_t bufferlen = PACKET_STACK_BUFFER_SIZE;
-
-        bufferlen = SSL_read(ssl, buffer, PACKET_STACK_BUFFER_SIZE); 
-        if (bufferlen == 0)
+        char request[8192];
+        if (read_http_head(ssl, request, sizeof(request)) < 0)
         {
             fprintf(stderr, "Server stopped responding while we waited for upgrade request\n");
             exit(1);
         }
 
-        buffer[bufferlen] = '\0';
         if (!no_http)
-            printf("Received:\n%s", buffer);
-        
-        uint8_t* default_protocol = (uint8_t*)"XRPL/2.1";
-        uint8_t* protocol = default_protocol;
+            printf("Received:\n%s", request);
 
-
-        // hacky way to grab which protocol to upgrade to, RH TODO: make this sensible
-        int find_comma = 0;
-        for (int i = 0; i < bufferlen - 10; ++i) //`Upgrade: `
+        // The connecting node checks our Network-ID against its own, so if
+        // none was configured adopt the one it sent us.
+        std::string their_nid = http_header(request, "Network-ID");
+        peer_network_id = their_nid;
+        peer_server = http_header(request, "User-Agent");
+        if (!their_nid.empty())
         {
-            if (find_comma && (buffer[i] == ',' || buffer[i] == '\r'))
+            char* endp = NULL;
+            long nid = strtol(their_nid.c_str(), &endp, 10);
+            if (endp && *endp == '\0' && nid >= 0)
             {
-                buffer[i] = '\0';
-                break;
-            }
-            if (!find_comma && memcmp(buffer + i, "Upgrade: ", 9) == 0)
-            {
-                protocol = buffer + i + 9;
-                find_comma = 1;
+                if (network_id < 0)
+                {
+                    network_id = nid;
+                    if (is_xahau_network_id(nid))
+                        use_xahau_defs = 1;
+                    xd_network = use_xahau_defs ? XD_NETWORK_XAHAU : XD_NETWORK_XRPL;
+                }
+                else if (nid != network_id)
+                    fprintf(stderr, "Warning: connecting node is on Network-ID %ld but we are configured for %ld, "
+                            "it will refuse the connection\n", nid, network_id);
             }
         }
-        
+
+        // Answer with the first protocol version they offered.
+        std::string protocol = http_header(request, "Upgrade");
+        size_t comma = protocol.find(',');
+        if (comma != std::string::npos)
+            protocol = protocol.substr(0, comma);
+        while (!protocol.empty() && protocol.back() == ' ')
+            protocol.pop_back();
+        if (protocol.empty())
+            protocol = "XRPL/2.1";
+
+        if (network_id >= 0)
+            snprintf(network_id_header, sizeof(network_id_header), "Network-ID: %ld\r\n", network_id);
 
         buf3len = snprintf(buf3, 2047,
             "HTTP/1.1 101 Switching Protocols\r\n"
@@ -452,21 +573,28 @@ SSL* ssl_handshake_and_upgrade(secp256k1_context* secp256k1ctx, int fd, SSL_CTX*
             "Connect-As: Peer\r\n"
             "Server: rippled-2.2.2\r\n"
             "Crawl: private\r\n"
+            "%s"
             "Public-Key: %s\r\n"
-            "Session-Signature: %s\r\n\r\n", protocol, b58, buf2);
+            "Session-Signature: %s\r\n\r\n", protocol.c_str(), network_id_header, b58, buf2);
 
     }
     else
     {
+        if (network_id >= 0)
+            snprintf(network_id_header, sizeof(network_id_header), "Network-ID: %ld\r\n", network_id);
+
+        // XRPL/2.1 for xahaud and older rippled, XRPL/2.2 for current rippled
+        // (which no longer offers 2.1). The peer picks the highest common one.
         buf3len = snprintf(buf3, 2047, 
                 "GET / HTTP/1.1\r\n"
                 "User-Agent: rippled-2.2.2\r\n"
-                "Upgrade: XRPL/2.1\r\n"
+                "Upgrade: XRPL/2.1, XRPL/2.2\r\n"
                 "Connection: Upgrade\r\n"
                 "Connect-As: Peer\r\n"
                 "Crawl: private\r\n"
+                "%s"
                 "Session-Signature: %s\r\n"
-                "Public-Key: %s\r\n\r\n", buf2, b58);
+                "Public-Key: %s\r\n\r\n", network_id_header, buf2, b58);
 
     }
 
@@ -497,13 +625,13 @@ message TMPing
 
 */
         uint8_t packet_buffer[512];
-        int packet_len = sizeof(packet_buffer);
 
         protocol::TMPing ping;
-        printf("%u mtPING - sending out\n");
+        printf("%lu mtPING - sending out\n", time(NULL));
         ping.set_type(protocol::TMPing_pingType_ptPING);
 
-        //unsigned char* buf = (unsigned char*) malloc(ping.ByteSizeLong());
+        // only send the serialized bytes, not the whole buffer
+        int packet_len = (int)ping.ByteSizeLong();
         ping.SerializeToArray(packet_buffer, packet_len);
 
         uint32_t reply_len = packet_len;
@@ -669,7 +797,7 @@ void process_packet(
         protocol::TMPing ping;
         bool success = ping.ParseFromArray( packet_buffer, packet_len ) ;
         if (!no_dump && display)
-            printf("%u mtPING - replying PONG\n");
+            printf("%lu mtPING - replying PONG\n", time(NULL));
         ping.set_type(protocol::TMPing_pingType_ptPONG);
 
         //unsigned char* buf = (unsigned char*) malloc(ping.ByteSizeLong());
@@ -1010,11 +1138,26 @@ message TMStatusChange
         time_t time_elapsed = time_now - time_start;
         if (time_elapsed <= 0) time_elapsed = 1;
 
+        char netdesc[192];
+        const char* nid = !peer_network_id.empty() ? peer_network_id.c_str() : NULL;
+        char ours[24];
+        if (!nid && network_id >= 0)
+            snprintf(ours, sizeof(ours), "%ld", network_id), nid = ours;
+        if (nid)
+            snprintf(netdesc, sizeof(netdesc), "%s, Network-ID %s", use_xahau_defs ? "Xahau" : "XRPL", nid);
+        else
+            snprintf(netdesc, sizeof(netdesc), "%s", use_xahau_defs ? "Xahau" : "XRPL");
+        if (!peer_server.empty())
+        {
+            size_t l = strlen(netdesc);
+            snprintf(netdesc + l, sizeof(netdesc) - l, ", %s", peer_server.c_str());
+        }
+
         printf(
-            "XRPL-Peermon -- Connected to Peer: %s for %lu sec\n\n"
+            "XRPL-Peermon -- Connected to Peer: %s [%s] for %lu sec\n\n"
             "Packet                    Total               Per second          Total Bytes         Data rate       \n"
             "------------------------------------------------------------------------------------------------------\n"
-            ,peer.c_str(), time_elapsed);
+            ,peer.c_str(), netdesc, time_elapsed);
 
         double total_rate = 0;
         uint64_t total_packets = 0;
@@ -1092,11 +1235,11 @@ message TMStatusChange
 
 int print_usage(int argc, char** argv, char* message)
 {
-    fprintf(stderr, "XRPL Peer Monitor\nVersion: %s\nRichard Holland / XRPL-Labs\n", VERSION);
+    fprintf(stderr, "XRPL / Xahau Peer Monitor\nVersion: %s\nRichard Holland / XRPL-Labs\n", VERSION);
     if (message)
         fprintf(stderr, "Error: %s\n", message);
     else
-        fprintf(stderr, "A tool to connect to a rippled node as a peer and monitor the traffic it produces\n");
+        fprintf(stderr, "A tool to connect to a rippled or xahaud node as a peer and monitor the traffic it produces\n");
     fprintf(stderr, "Usage: %s IP PORT [OPTIONS] [show:mtPACKET,... | hide:mtPACKET,...]\n", argv[0]);
     fprintf(stderr, "Options:\n"
             "\tslow\t\t- Only print at most once every 5 seconds. Will skip displaying most packets. Use for stats.\n"
@@ -1109,6 +1252,13 @@ int print_usage(int argc, char** argv, char* message)
             "\tno-hex\t\t- Never print hex, only parsed / able-to-be-parsed STObjects or omit.\n"
             "\tlisten\t\t- experimental do not use.\n"
             );
+    fprintf(stderr, "Network:\n"
+            "\txahau\t\t- Xahau: decode with Xahau definitions and send Network-ID %d (Xahau mainnet)\n"
+            "\t\t\t  unless network-id:N is also given.\n"
+            "\tnetwork-id:N\t- Send Network-ID N in the handshake. Needed for every Xahau network and for\n"
+            "\t\t\t  non-mainnet XRPL networks. IDs 21330-21339 (Xahau) imply `xahau`.\n"
+            "\t\t\t  Default: no Network-ID header and XRPL definitions.\n",
+            XAHAU_MAINNET_NETWORK_ID);
     fprintf(stderr, "Show / Hide:\n"
             "\tshow:mtPACKET[,mtPACKET...]\t\t- Show only the packets in the comma seperated list (no spaces!)\n"
             "\thide:mtPACKET[,mtPACKET...]\t\t- Show all packets except those in the comma seperated list.\n"
@@ -1124,8 +1274,10 @@ int print_usage(int argc, char** argv, char* message)
             "\tIf this is not the behaviour you want please place a binary 32 byte key file at ~/.peermon.\n");
     fprintf(stderr, "Example:\n"
         "\t%s r.ripple.com 51235 no-dump\t\t\t\t\t# display realtime stats for this node\n"
-        "\t%s r.ripple.com 51235 no-cls no-stats show:mtGET_LEDGER\t\t# show only the GET_LEDGER packets"
-        "\n", argv[0], argv[0]);
+        "\t%s r.ripple.com 51235 no-cls no-stats show:mtGET_LEDGER\t\t# show only the GET_LEDGER packets\n"
+        "\t%s hubs.xahau.as16089.net 21337 xahau no-dump\t\t\t# Xahau mainnet stats\n"
+        "\t%s bacab.alloy.ee 21337 xahau no-cls no-stats show:mtTRANSACTION\t\t# decoded Xahau transactions"
+        "\n", argv[0], argv[0], argv[0], argv[0]);
     return 1;
 }
 
@@ -1185,6 +1337,17 @@ int main(int argc, char** argv)
             slow = 1;
         else if (strcmp(opt, "manifests-only") == 0)
             manifests_only = 1;
+        else if (strcmp(opt, "xahau") == 0)
+            use_xahau_defs = 1;
+        else if (len > 11 && memcmp(opt, "network-id:", 11) == 0)
+        {
+            char* endp = NULL;
+            errno = 0;
+            unsigned long long v = strtoull(opt + 11, &endp, 10);
+            if (errno || !endp || *endp != '\0' || opt[11] == '-' || v > 0xFFFFFFFFULL)
+                return print_usage(argc, argv, "Invalid network-id (expected an unsigned 32 bit integer)");
+            network_id = (long)v;
+        }
         else if (strcmp(opt, "raw-hex") == 0)
         {
             if (no_hex)
@@ -1234,6 +1397,12 @@ int main(int argc, char** argv)
     }
 
 
+    if (use_xahau_defs && network_id < 0)
+        network_id = XAHAU_MAINNET_NETWORK_ID;
+    if (is_xahau_network_id(network_id))
+        use_xahau_defs = 1;
+    xd_network = use_xahau_defs ? XD_NETWORK_XAHAU : XD_NETWORK_XRPL;
+
     b58_sha256_impl = calc_sha_256; 
     if (sodium_init() < 0) {
         fprintf(stderr, "[FATAL] Could not init libsodium\n");
@@ -1269,106 +1438,117 @@ int main(int argc, char** argv)
         exit(12);
     }
  
-    unsigned char buffer[PACKET_STACK_BUFFER_SIZE];
-    size_t bufferlen = PACKET_STACK_BUFFER_SIZE;
+    if (!listen_mode)
+    {
+        // HTTP upgrade response
+        char head[8192];
+        int head_len = read_http_head(ssl, head, sizeof(head));
+        if (head_len < 0)
+            return 2;
 
-    int pc = (listen_mode ? 1 : 0);
-    while (fd_valid(fd)) {
-        bufferlen = SSL_read(ssl, buffer, (pc == 0 ? PACKET_STACK_BUFFER_SIZE : 10)); 
-        if (bufferlen == 0)
+        if (!no_http)
+            printf("Received:\n%s", head);
+
+        if (head_len < 12 || memcmp(head, "HTTP/1.1 101", 12) != 0)
         {
-            int status = SSL_get_error(ssl, bufferlen);
-            fprintf(stderr, "SSL_get_error code %d\n", status);
-            fprintf(stderr, "Server stopped responding\n");
-            break;
-        }
+            const char* eol = strstr(head, "\r\n");
+            int status_len = eol ? (int)(eol - head) : head_len;
 
-        buffer[bufferlen] = '\0';
-        if (!pc) {
-            if (!no_http)
-                printf("Received:\n%s", buffer);
-
-            if (bufferlen >= sizeof("HTTP/1.1 503 Service Unavailable")-1 &&
-                memcmp(buffer, "HTTP/1.1 503 Service Unavailable", sizeof("HTTP/1.1 503 Service Unavailable")-1) == 0)
+            if (memcmp(head, "HTTP/1.1 503", 12) == 0)
             {
-                fprintf(stderr, "Node reported Service Unavailable\n");
+                fprintf(stderr, "Node reported Service Unavailable (no free peer slots)\n");
+                // body (if it arrived with the head) lists peers it suggests instead
+                if (pending_len > 0)
+                    fprintf(stderr, "Suggested peers: %.*s\n", (int)pending_len, (char*)pending);
                 return 2;
             }
 
-            pc++;
-            continue;
+            fprintf(stderr, "Peer refused the connection: %.*s\n", status_len, head);
+            if (strstr(head, "different network"))
+            {
+                if (network_id < 0)
+                    fprintf(stderr,
+                        "We sent no Network-ID, which Xahau treats as network 0.\n"
+                        "Add `xahau` for Xahau mainnet (%d), or network-id:N for another network "
+                        "(e.g. network-id:21338 for Xahau testnet).\n", XAHAU_MAINNET_NETWORK_ID);
+                else
+                    fprintf(stderr, "We sent Network-ID %ld; the peer is on a different network.\n", network_id);
+            }
+            else if (strstr(head, "protocol version"))
+                fprintf(stderr, "We offered XRPL/2.1 and XRPL/2.2.\n");
+            return 2;
         }
 
+        peer_network_id = http_header(head, "Network-ID");
+        peer_server = http_header(head, "Server");
 
-        // check header version
-//        if (buffer[0] >> 2 != 0) {
-//            fprintf(stderr, "[FATAL] Peer sent packets we don't understand\n");
-//            exit(13);
-//        }
+        if (!peer_network_id.empty() && network_id >= 0 && peer_network_id != std::to_string(network_id))
+            fprintf(stderr, "Warning: peer reports Network-ID %s, we sent %ld\n", peer_network_id.c_str(), network_id);
+        if (!peer_network_id.empty() && is_xahau_network_id(atol(peer_network_id.c_str())) && !use_xahau_defs)
+            fprintf(stderr, "Warning: peer is on Xahau Network-ID %s but XRPL definitions are in use\n",
+                    peer_network_id.c_str());
+    }
 
-        // first 4 bytes are bigendian payload size
+    // Peer protocol messages. Header: 4 byte big-endian payload size (top
+    // nibble flags compression, in which case 4 more bytes give the
+    // uncompressed size) then 2 byte message type.
+    unsigned char buffer[PACKET_STACK_BUFFER_SIZE];
+    const uint32_t max_message_size = 64U * 1024U * 1024U; // rippled / xahaud limit
+
+    while (fd_valid(fd)) {
+        uint8_t header[10];
+        if (!read_exact(ssl, header, 6))
+            break;
+
         uint32_t payload_size = 
-            (buffer[0] << 24) + (buffer[1] << 16) + (buffer[2] << 8) + buffer[3];
+            ((uint32_t)header[0] << 24) + (header[1] << 16) + (header[2] << 8) + header[3];
         int compressed = payload_size >> 28U;
         
         if (compressed)
             payload_size &= 0x0FFFFFFFU;
 
-        uint16_t packet_type = (buffer[4] << 8) + buffer[5];
+        uint16_t packet_type = (header[4] << 8) + header[5];
 
         uint32_t uncompressed_size = payload_size;
         if (compressed)
-            uncompressed_size = 
-                (buffer[6] << 24) + (buffer[7] << 16) + (buffer[8] << 8) + buffer[9];
-
-        int header_size = (compressed ? 10 : 6);
-
-//        printf("HEADER: %02X%02X%02X%02X %02X%02X %02X%02X%02X%02X\n", buffer[0], buffer[1], buffer[2], buffer[3],
-//                buffer[4], buffer[5],
-//                buffer[6], buffer[7], buffer[8], buffer[9]);
-
-        // the vast majority of packets will fit in the stack buffer, but for those which do not, we will read the rest into heap
-        if (payload_size + header_size > bufferlen)
         {
+            if (!read_exact(ssl, header + 6, 4))
+                break;
+            uncompressed_size = 
+                ((uint32_t)header[6] << 24) + (header[7] << 16) + (header[8] << 8) + header[9];
+        }
 
-//            printf("payload_size[%d] + header_size[%d] = %d, bufferlen = %d\n",
-//                    payload_size, header_size, payload_size + header_size, bufferlen); 
-            // incomplete packet, receive the rest into a heap buffer
-            
-            size_t total_read = bufferlen - header_size;
+        if (payload_size > max_message_size)
+        {
+            fprintf(stderr, "Peer sent an oversized message (%u bytes, type %u), stream is corrupt\n",
+                    payload_size, packet_type);
+            break;
+        }
 
-            unsigned char* heapbuf = (unsigned char*) malloc( payload_size );
-            
-            // inefficient copy
-            for (size_t i = header_size; i < bufferlen; ++i)
-                heapbuf[i - header_size] = buffer[i];
-
-
-            while (total_read < payload_size)
+        // the vast majority of packets will fit in the stack buffer, the rest go on the heap
+        unsigned char* body = buffer;
+        if (payload_size > sizeof(buffer))
+        {
+            body = (unsigned char*) malloc(payload_size);
+            if (!body)
             {
-                size_t bytes_read = SSL_read(ssl, heapbuf + total_read, payload_size - total_read);
-                if (bytes_read == 0)
-                {
-                    fprintf(stderr, "Error reading / disconnect\n");
-                    exit(1);
-                }
-//                printf("Large message... read %d bytes of %d...\n", bytes_read, payload_size);
-                total_read += bytes_read;
+                fprintf(stderr, "Could not allocate %u bytes\n", payload_size);
+                break;
             }
+        }
 
-//            printf("payload_size: %d  toal_read: %d\n", payload_size, total_read);
-
-            process_packet(
-                    ssl, packet_type, heapbuf, payload_size, compressed, uncompressed_size);
-            
-            free(heapbuf);
-
-            continue;
+        if (!read_exact(ssl, body, payload_size))
+        {
+            if (body != buffer)
+                free(body);
+            break;
         }
 
         process_packet(
-                ssl, packet_type, buffer + header_size, bufferlen - header_size, compressed, uncompressed_size);
-        
+                ssl, packet_type, body, payload_size, compressed, uncompressed_size);
+
+        if (body != buffer)
+            free(body);
     }
 
     secp256k1_context_destroy(secp256k1ctx);

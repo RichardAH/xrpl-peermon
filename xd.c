@@ -1,7 +1,7 @@
 extern "C" {
 
 /**
- * XRPL Deserializer 
+ * XRPL / Xahau Deserializer
  * Author: Richard Holland
  * Date: 21/5/21
  * Pass a hex encoded xrpl binary object via argument to the executable
@@ -15,6 +15,7 @@ extern "C" {
 #include <sys/ioctl.h>
 #include <unistd.h>
 #include "libbase58.h"
+#include "xd.h"
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <fcntl.h>
@@ -141,83 +142,121 @@ int append(int indent_level, uint8_t** output, int* upto, int* len, int write_fd
     }\
 }
 
-#define SHORTCHECK() ;/* if (upto >= len) return -1;*/
+/*
+ * Field, transaction, ledger entry and result names come from xd_defs.h,
+ * which gen_defs.py generates from rippled's and xahaud's own definition
+ * macros. The two networks share the wire format but not these tables (the
+ * same type/field code can name different fields), so the active table is
+ * selected at runtime with xd_network.
+ */
+#include "xd_defs.h"
+
+int xd_network = XD_NETWORK_XRPL;
+
+static const char* xd_field_name(int type_code, int field_code)
+{
+    int key = (type_code << 8) | field_code;
+    return xd_network == XD_NETWORK_XAHAU ? xd_field_name_xahau(key) : xd_field_name_xrpl(key);
+}
+
+static const char* xd_tx_name(int v)
+{
+    return xd_network == XD_NETWORK_XAHAU ? xd_tx_name_xahau(v) : xd_tx_name_xrpl(v);
+}
+
+static const char* xd_le_name(int v)
+{
+    return xd_network == XD_NETWORK_XAHAU ? xd_le_name_xahau(v) : xd_le_name_xrpl(v);
+}
+
+static const char* xd_ter_name(int v)
+{
+    return xd_network == XD_NETWORK_XAHAU ? xd_ter_name_xahau(v) : xd_ter_name_xrpl(v);
+}
+
+const char* xd_native_currency(void)
+{
+    return xd_network == XD_NETWORK_XAHAU ? "XAH" : "XRP";
+}
+
+static uint64_t be64(const uint8_t* p)
+{
+    uint64_t r = 0;
+    for (int i = 0; i < 8; ++i)
+        r = (r << 8U) | p[i];
+    return r;
+}
+
+static uint32_t be32(const uint8_t* p)
+{
+    return ((uint32_t)p[0] << 24U) | ((uint32_t)p[1] << 16U) | ((uint32_t)p[2] << 8U) | p[3];
+}
+
+// Renders mantissa * 10^exponent as a quoted decimal string.
+// Returns the number of bytes written (including the NUL) or -1 if it would
+// not fit in len bytes, in which case the caller should fall back to
+// scientific notation.
 int to_fixed_point(uint8_t* outbuf, int len, uint64_t mantissa, int64_t exponent, int negative)
 {
-    //printf("mantissa: %llu, exponent: %d\n", mantissa, exponent);
     int upto = 0;
-    char digits[17];
-    int digitcount = snprintf(digits, 17, "%llu", mantissa);
+    char digits[24];
+    int digitcount = snprintf(digits, sizeof(digits), "%llu", (unsigned long long)mantissa);
     int digitupto = 0;
-    int point = exponent + digitcount;
-
+    int64_t point = exponent + digitcount;
     int printed_point = 0;
 
-    outbuf[upto++] = '"';
-    SHORTCHECK();
-    if (negative)
+#define PUT(c) { if (upto >= len - 2) return -1; outbuf[upto++] = (c); }
+    PUT('"');
+    if (mantissa == 0)
+        PUT('0')
+    else
     {
-        outbuf[upto++] = '-';
-        SHORTCHECK();
-    }
-    
-    for (; point > 0; --point)
-    {
-        outbuf[upto++] = (digitupto >= digitcount ? '0' : digits[digitupto++]);
-        SHORTCHECK();
-    }
-    
-    if (digitupto < digitcount) // && point != 0)
-    {
-        if (digitupto == 0)
-        {
-            outbuf[upto++] = '0';
-            SHORTCHECK();
-        }
-   
-        outbuf[upto++] = '.';
-        SHORTCHECK();
+        if (negative)
+            PUT('-');
 
-        printed_point = 1;
-    
-        for (; point < 0; ++point)
+        for (; point > 0; --point)
+            PUT(digitupto >= digitcount ? '0' : digits[digitupto++]);
+
+        if (digitupto < digitcount)
         {
-            outbuf[upto++] = '0';
-            SHORTCHECK();
+            if (digitupto == 0)
+                PUT('0');
+            PUT('.');
+            printed_point = 1;
+            for (; point < 0; ++point)
+                PUT('0');
+            while (digitupto < digitcount)
+                PUT(digits[digitupto++]);
         }
-        while (digitupto < digitcount)
+
+        // backtrack any trailing zeros, and the point itself if nothing is left after it
+        if (printed_point)
         {
-            outbuf[upto++] = (digitupto >= digitcount ? '0' : digits[digitupto++]);
-            SHORTCHECK();
+            while (outbuf[upto - 1] == '0')
+                --upto;
+            if (outbuf[upto - 1] == '.')
+                --upto;
         }
     }
-
-    // backtrack any trailing zeros
-    if (printed_point)
-        for (; outbuf[upto-1] == '0'; --upto);
-
-    outbuf[upto++] = '"';
-    SHORTCHECK();
-
+    PUT('"');
+#undef PUT
     outbuf[upto++] = '\0';
-
-
     return upto;
 }
 
+// Standard (3 character) currency code, same character set rippled accepts.
 int is_ascii_currency(uint8_t* y)
 {
+    static const char extra[] = "<>(){}[]|?!@#$%^&*";
     for (int i = 0; i < 12; ++i)
         if (y[i] != 0)
             return 0;
     for (int i = 12; i < 15; ++i)
     {
         char x = y[i];
-        if (x >= 'a' && x <= 'z')
+        if ((x >= 'a' && x <= 'z') || (x >= 'A' && x <= 'Z') || (x >= '0' && x <= '9'))
             continue;
-        if (x >= 'A' && x <= 'Z')
-            continue;
-        if (x >= '0' && x <= '9')
+        if (x != 0 && strchr(extra, x))
             continue;
         return 0;
     }
@@ -227,6 +266,130 @@ int is_ascii_currency(uint8_t* y)
     return 1;
 }
 
+static int is_zero(const uint8_t* p, int n)
+{
+    for (int i = 0; i < n; ++i)
+        if (p[i])
+            return 0;
+    return 1;
+}
+
+// rippled's noAccount(): 0x000...01, used as the MPT marker inside STIssue
+static int is_no_account(const uint8_t* p)
+{
+    return is_zero(p, 19) && p[19] == 1;
+}
+
+static void xd_currency(char dst[41], const uint8_t* c)
+{
+    if (is_zero(c, 20))
+    {
+        strcpy(dst, xd_native_currency());
+        return;
+    }
+    if (is_ascii_currency((uint8_t*)c))
+    {
+        dst[0] = (char)c[12];
+        dst[1] = (char)c[13];
+        dst[2] = (char)c[14];
+        dst[3] = '\0';
+        return;
+    }
+    HEX(dst, c, 20);
+    dst[40] = '\0';
+}
+
+static int xd_account(char* out, size_t outsz, const uint8_t* acc20)
+{
+    size_t sz = outsz;
+    if (!b58check_enc(out, &sz, 0, acc20, 20))
+        return 0;
+    out[0] = 'r';
+    return 1;
+}
+
+static void xd_tabs(char* out, int n)
+{
+    if (n > 30) n = 30;
+    for (int i = 0; i < n; ++i)
+        out[i] = '\t';
+    out[n] = '\0';
+}
+
+// Wire length of an STIssue starting at p. The caller must already have
+// made the first 20 bytes available, and the first 40 if not native.
+static int xd_issue_len(const uint8_t* p)
+{
+    if (is_zero(p, 20))
+        return 20;
+    return is_no_account(p + 20) ? 44 : 40;
+}
+
+// STIssue as a JSON object; ind = indent of the closing brace.
+static int xd_issue_json(char* out, int outsz, const uint8_t* p, int ind)
+{
+    char t0[32], t1[32];
+    xd_tabs(t0, ind);
+    xd_tabs(t1, ind + 1);
+    int l = xd_issue_len(p);
+    if (l == 20)
+    {
+        snprintf(out, outsz, "{\n%s\"currency\": \"%s\"\n%s}", t1, xd_native_currency(), t0);
+        return l;
+    }
+    if (l == 44)
+    {
+        // MPT: issuer(20) | noAccount(20) | sequence(4). The sequence is
+        // written byte-reversed relative to the canonical MPTID.
+        uint8_t mpt[24];
+        mpt[0] = p[43];
+        mpt[1] = p[42];
+        mpt[2] = p[41];
+        mpt[3] = p[40];
+        memcpy(mpt + 4, p, 20);
+        char hex[49];
+        HEX(hex, mpt, 24);
+        hex[48] = '\0';
+        snprintf(out, outsz, "{\n%s\"mpt_issuance_id\": \"%s\"\n%s}", t1, hex, t0);
+        return l;
+    }
+    char cur[41], acc[64];
+    xd_currency(cur, p);
+    if (!xd_account(acc, sizeof(acc), p + 20))
+        return -1;
+    snprintf(out, outsz, "{\n%s\"currency\": \"%s\",\n%s\"issuer\": \"%s\"\n%s}", t1, cur, t1, acc, t0);
+    return l;
+}
+
+#define APPENDS(params, str) append(params, (str), (int)strlen(str) + 1)
+
+// Reads a VL length prefix into field_len (breaks out of the parse loop on error).
+#define READ_VL(field_len)\
+{\
+    REQUIRE(1);\
+    field_len = *n;\
+    if (field_len <= 192)\
+    {\
+        ADVANCE(1);\
+    }\
+    else if (field_len <= 240)\
+    {\
+        REQUIRE(2);\
+        field_len = 193 + ((field_len - 193) * 256) + *(n+1);\
+        ADVANCE(2);\
+    }\
+    else if (field_len <= 254)\
+    {\
+        REQUIRE(3);\
+        field_len = 12481 + ((field_len - 241) * 65536) + ((*(n+1)) * 256) + *(n+2);\
+        ADVANCE(3);\
+    }\
+    else\
+    {\
+        fprintf(stderr, "Error: invalid VL length prefix 0x%02X\n", (unsigned)field_len);\
+        break;\
+    }\
+}
 
 int deserialize(
         uint8_t** output,
@@ -265,9 +428,6 @@ int deserialize(
     int array_level = 0;
     int indent_level = 0;
 
-
-
-
     uint64_t parent_is_array = 0;
 
     append(APPENDPARAMS, SBUF("{\n"));
@@ -284,7 +444,9 @@ int deserialize(
             _REQUIRE(1, 1);
             if (remaining == 0)
                 break;
-        }    
+        }
+        else if (remaining <= 0)
+            break;
 
         if (array_level < 0)
         {
@@ -300,42 +462,26 @@ int deserialize(
         int field_code = -1;
         int type_code = -1;
 
-        if (n == 0)
+        if (*n == 0)
         {
+            // 3 byte header (typecode >= 16 && field code >= 16)
             REQUIRE(3);
-            // 3 byte header
-            if (remaining < 2)
-            {
-                fprintf(stderr, "\nError parsing 3 byte header, not enough bytes remaining\n");
-                return 0;
-            }
-
             type_code = *(n+1);
             field_code = *(n+2);
             ADVANCE(3);
         }
         else if ((*n >> 4U) == 0)
         {
-            REQUIRE(2);
             // 2 byte header (typecode >= 16 && field code < 16)
-            if (remaining < 1)
-            {
-                fprintf(stderr, "\nError parsing 2 byte header, not enough bytes remaining\n");
-                return 0;
-            }
+            REQUIRE(2);
             field_code = (*n & 0xFU);
             type_code = *(n+1);
             ADVANCE(2);
         }
         else if ((*n & 0xFU) == 0)
         {
-            REQUIRE(2);
             // 2 byte header (typecode < 16 && field code >= 16)
-            if (remaining < 1)
-            {
-                fprintf(stderr, "\nError parsing 2 byte header, not enough bytes remaining\n");
-                return 0;
-            }
+            REQUIRE(2);
             type_code = (*n >> 4U);
             field_code = *(n+1);
             ADVANCE(2);
@@ -343,12 +489,10 @@ int deserialize(
         else
         {
             // 1 byte header
-
             type_code = (*n >> 4U);
             field_code = (*n & 0xFU);
             ADVANCE(1);
         }
-       
 
         int end_of_object = ((type_code == 14 || type_code == 15) && field_code == 1);
         
@@ -376,217 +520,48 @@ int deserialize(
             return 0;
         }
 
-        int error = 0;
+        // fixed width hex types
+        int hex_size =
+            ( type_code == 4  ? 16 : // uint128
+            ( type_code == 5  ? 32 : // uint256
+            ( type_code == 17 ? 20 : // uint160
+            ( type_code == 20 ? 12 : // uint96
+            ( type_code == 21 ? 24 : // uint192
+            ( type_code == 22 ? 48 : // uint384
+            ( type_code == 23 ? 64 : // uint512
+              0)))))));
 
-        int size = 
-            ( type_code == 1 ? 2U : // UINT16
-            ( type_code == 2 ? 4U : // uint32
-            ( type_code == 3 ? 8U : // uint64
-            ( type_code == 4 ? 16U : // uint128
-            ( type_code == 5 ? 32U : // uint256
-            ( type_code == 6 ? 8U  : // amount (8 bytes or 48 bytes)
-            ( type_code == 7 ? 0U  : // blob vl
-            ( type_code == 8 ? 21U : // account
-            ( type_code == 16 ? 1U : // uint8
-            ( type_code == 17 ? 20U : // uint160
-            ( type_code == 18 ? 0U  : // pathset
-            ( type_code == 19 ? 0U : // vector256
-            ( type_code == 14 ? 0U : // array/object
-            ( type_code == 15 ? 0U : // array/object
-                (error=1)))))))))))))));
-        
-        if (error)
+        int known_type = hex_size > 0 ||
+            (type_code >= 1 && type_code <= 3) ||    // uint16, uint32, uint64
+            (type_code >= 6 && type_code <= 11) ||   // amount, vl, account, number, int32, int64
+            type_code == 14 || type_code == 15 ||    // object, array
+            type_code == 16 ||                       // uint8
+            type_code == 18 || type_code == 19 ||    // pathset, vector256
+            (type_code >= 24 && type_code <= 26);    // issue, xchain bridge, currency
+
+        if (!known_type)
         {
-            fprintf(stderr, "Error, unknown typecode %lu at byte %d\n", type_code, (input - n));
-            return 0;
+            fprintf(stderr, "Error: unknown type code %d (field code %d), stopping\n", type_code, field_code);
+            break;
         }
 
-
-        uint32_t field_id = (type_code << 16U) + field_code;
-
-        if (DEBUG)
-            printf("field_id: %llx\n", field_id);
-        
-        if (parent_is_array & 1 && !((type_code == 14 || type_code == 15) && field_code == 1))
+        if (parent_is_array & 1 && !end_of_object)
         {
             append(APPENDPARAMS, SBUF("{\n"));
             indent_level++;
         }
 
-        if (field_id == -1UL) append(APPENDPARAMS, SBUF("\"Invalid\": "));
-        else if (field_id == 0UL) append(APPENDPARAMS, SBUF("\"Generic\": "));
-        else if (field_id == 0x27120101UL) append(APPENDPARAMS, SBUF("\"LedgerEntry\": "));
-        else if (field_id == 0x27110101UL) append(APPENDPARAMS, SBUF("\"Transaction\": "));
-        else if (field_id == 0x27130101UL) append(APPENDPARAMS, SBUF("\"Validation\": "));
-        else if (field_id == 0x27140101UL) append(APPENDPARAMS, SBUF("\"Metadata\": "));
-        else if (field_id == 0x50101UL) append(APPENDPARAMS, SBUF("\"Hash\": "));
-        else if (field_id == 0x50102UL) append(APPENDPARAMS, SBUF("\"Index\": "));
-        else if (field_id == 0x100001UL) append(APPENDPARAMS, SBUF("\"CloseResolution\": "));
-        else if (field_id == 0x100002UL) append(APPENDPARAMS, SBUF("\"Method\": "));
-        else if (field_id == 0x100003UL) append(APPENDPARAMS, SBUF("\"TransactionResult\": "));
-        else if (field_id == 0x100010UL) append(APPENDPARAMS, SBUF("\"TickSize\": "));
-        else if (field_id == 0x100011UL) append(APPENDPARAMS, SBUF("\"UNLModifyDisabling\": "));
-        else if (field_id == 0x10001UL) append(APPENDPARAMS, SBUF("\"LedgerEntryType\": "));
-        else if (field_id == 0x10002UL) append(APPENDPARAMS, SBUF("\"TransactionType\": "));
-        else if (field_id == 0x10003UL) append(APPENDPARAMS, SBUF("\"SignerWeight\": "));
-        else if (field_id == 0x10010UL) append(APPENDPARAMS, SBUF("\"Version\": "));
-        else if (field_id == 0x20002UL) append(APPENDPARAMS, SBUF("\"Flags\": "));
-        else if (field_id == 0x20003UL) append(APPENDPARAMS, SBUF("\"SourceTag\": "));
-        else if (field_id == 0x20004UL) append(APPENDPARAMS, SBUF("\"Sequence\": "));
-        else if (field_id == 0x20005UL) append(APPENDPARAMS, SBUF("\"PreviousTxnLgrSeq\": "));
-        else if (field_id == 0x20006UL) append(APPENDPARAMS, SBUF("\"LedgerSequence\": "));
-        else if (field_id == 0x20007UL) append(APPENDPARAMS, SBUF("\"CloseTime\": "));
-        else if (field_id == 0x20008UL) append(APPENDPARAMS, SBUF("\"ParentCloseTime\": "));
-        else if (field_id == 0x20009UL) append(APPENDPARAMS, SBUF("\"SigningTime\": "));
-        else if (field_id == 0x2000aUL) append(APPENDPARAMS, SBUF("\"Expiration\": "));
-        else if (field_id == 0x2000bUL) append(APPENDPARAMS, SBUF("\"erRate\": "));
-        else if (field_id == 0x2000cUL) append(APPENDPARAMS, SBUF("\"WalletSize\": "));
-        else if (field_id == 0x2000dUL) append(APPENDPARAMS, SBUF("\"OwnerCount\": "));
-        else if (field_id == 0x2000eUL) append(APPENDPARAMS, SBUF("\"DestinationTag\": "));
-        else if (field_id == 0x20010UL) append(APPENDPARAMS, SBUF("\"HighQualityIn\": "));
-        else if (field_id == 0x20011UL) append(APPENDPARAMS, SBUF("\"HighQualityOut\": "));
-        else if (field_id == 0x20012UL) append(APPENDPARAMS, SBUF("\"LowQualityIn\": "));
-        else if (field_id == 0x20013UL) append(APPENDPARAMS, SBUF("\"LowQualityOut\": "));
-        else if (field_id == 0x20014UL) append(APPENDPARAMS, SBUF("\"QualityIn\": "));
-        else if (field_id == 0x20015UL) append(APPENDPARAMS, SBUF("\"QualityOut\": "));
-        else if (field_id == 0x20016UL) append(APPENDPARAMS, SBUF("\"StampEscrow\": "));
-        else if (field_id == 0x20017UL) append(APPENDPARAMS, SBUF("\"BondAmount\": "));
-        else if (field_id == 0x20018UL) append(APPENDPARAMS, SBUF("\"LoadFee\": "));
-        else if (field_id == 0x20019UL) append(APPENDPARAMS, SBUF("\"OfferSequence\": "));
-        else if (field_id == 0x2001aUL) append(APPENDPARAMS, SBUF("\"FirstLedgerSequence\": "));
-        else if (field_id == 0x2001bUL) append(APPENDPARAMS, SBUF("\"LastLedgerSequence\": "));
-        else if (field_id == 0x2001cUL) append(APPENDPARAMS, SBUF("\"TransactionIndex\": "));
-        else if (field_id == 0x2001dUL) append(APPENDPARAMS, SBUF("\"OperationLimit\": "));
-        else if (field_id == 0x2001eUL) append(APPENDPARAMS, SBUF("\"ReferenceFeeUnits\": "));
-        else if (field_id == 0x2001fUL) append(APPENDPARAMS, SBUF("\"ReserveBase\": "));
-        else if (field_id == 0x20020UL) append(APPENDPARAMS, SBUF("\"ReserveIncrement\": "));
-        else if (field_id == 0x20021UL) append(APPENDPARAMS, SBUF("\"SetFlag\": "));
-        else if (field_id == 0x20022UL) append(APPENDPARAMS, SBUF("\"ClearFlag\": "));
-        else if (field_id == 0x20023UL) append(APPENDPARAMS, SBUF("\"SignerQuorum\": "));
-        else if (field_id == 0x20024UL) append(APPENDPARAMS, SBUF("\"CancelAfter\": "));
-        else if (field_id == 0x20025UL) append(APPENDPARAMS, SBUF("\"FinishAfter\": "));
-        else if (field_id == 0x20026UL) append(APPENDPARAMS, SBUF("\"SignerListID\": "));
-        else if (field_id == 0x20027UL) append(APPENDPARAMS, SBUF("\"SettleDelay\": "));
-        else if (field_id == 0x20028UL) append(APPENDPARAMS, SBUF("\"HookStateCount\": "));
-        else if (field_id == 0x20029UL) append(APPENDPARAMS, SBUF("\"HookReserveCount\": "));
-        else if (field_id == 0x2002aUL) append(APPENDPARAMS, SBUF("\"HookDataMaxSize\": "));
-        else if (field_id == 0x2002bUL) append(APPENDPARAMS, SBUF("\"EmitGeneration\": "));
-        else if (field_id == 0x30001UL) append(APPENDPARAMS, SBUF("\"IndexNext\": "));
-        else if (field_id == 0x30002UL) append(APPENDPARAMS, SBUF("\"IndexPrevious\": "));
-        else if (field_id == 0x30003UL) append(APPENDPARAMS, SBUF("\"BookNode\": "));
-        else if (field_id == 0x30004UL) append(APPENDPARAMS, SBUF("\"OwnerNode\": "));
-        else if (field_id == 0x30005UL) append(APPENDPARAMS, SBUF("\"BaseFee\": "));
-        else if (field_id == 0x30006UL) append(APPENDPARAMS, SBUF("\"ExchangeRate\": "));
-        else if (field_id == 0x30007UL) append(APPENDPARAMS, SBUF("\"LowNode\": "));
-        else if (field_id == 0x30008UL) append(APPENDPARAMS, SBUF("\"HighNode\": "));
-        else if (field_id == 0x30009UL) append(APPENDPARAMS, SBUF("\"DestinationNode\": "));
-        else if (field_id == 0x3000aUL) append(APPENDPARAMS, SBUF("\"Cookie\": "));
-        else if (field_id == 0x3000bUL) append(APPENDPARAMS, SBUF("\"ServerVersion\": "));
-        else if (field_id == 0x3000cUL) append(APPENDPARAMS, SBUF("\"EmitBurden\": "));
-        else if (field_id == 0x30010UL) append(APPENDPARAMS, SBUF("\"HookOn\": "));
-        else if (field_id == 0x40001UL) append(APPENDPARAMS, SBUF("\"EmailHash\": "));
-        else if (field_id == 0x110001UL) append(APPENDPARAMS, SBUF("\"TakerPaysCurrency\": "));
-        else if (field_id == 0x110002UL) append(APPENDPARAMS, SBUF("\"TakerPaysIssuer\": "));
-        else if (field_id == 0x110003UL) append(APPENDPARAMS, SBUF("\"TakerGetsCurrency\": "));
-        else if (field_id == 0x110004UL) append(APPENDPARAMS, SBUF("\"TakerGetsIssuer\": "));
-        else if (field_id == 0x50001UL) append(APPENDPARAMS, SBUF("\"LedgerHash\": "));
-        else if (field_id == 0x50002UL) append(APPENDPARAMS, SBUF("\"ParentHash\": "));
-        else if (field_id == 0x50003UL) append(APPENDPARAMS, SBUF("\"TransactionHash\": "));
-        else if (field_id == 0x50004UL) append(APPENDPARAMS, SBUF("\"AccountHash\": "));
-        else if (field_id == 0x50005UL) append(APPENDPARAMS, SBUF("\"PreviousTxnID\": "));
-        else if (field_id == 0x50006UL) append(APPENDPARAMS, SBUF("\"LedgerIndex\": "));
-        else if (field_id == 0x50007UL) append(APPENDPARAMS, SBUF("\"WalletLocator\": "));
-        else if (field_id == 0x50008UL) append(APPENDPARAMS, SBUF("\"RootIndex\": "));
-        else if (field_id == 0x50009UL) append(APPENDPARAMS, SBUF("\"AccountTxnID\": "));
-        else if (field_id == 0x5000aUL) append(APPENDPARAMS, SBUF("\"EmitParentTxnID\": "));
-        else if (field_id == 0x5000bUL) append(APPENDPARAMS, SBUF("\"EmitNonce\": "));
-        else if (field_id == 0x50010UL) append(APPENDPARAMS, SBUF("\"BookDirectory\": "));
-        else if (field_id == 0x50011UL) append(APPENDPARAMS, SBUF("\"InvoiceID\": "));
-        else if (field_id == 0x50012UL) append(APPENDPARAMS, SBUF("\"Nickname\": "));
-        else if (field_id == 0x50013UL) append(APPENDPARAMS, SBUF("\"Amendment\": "));
-        else if (field_id == 0x50014UL) append(APPENDPARAMS, SBUF("\"TicketID\": "));
-        else if (field_id == 0x50015UL) append(APPENDPARAMS, SBUF("\"Digest\": "));
-        else if (field_id == 0x50016UL) append(APPENDPARAMS, SBUF("\"PayChannel\": "));
-        else if (field_id == 0x50017UL) append(APPENDPARAMS, SBUF("\"ConsensusHash\": "));
-        else if (field_id == 0x50018UL) append(APPENDPARAMS, SBUF("\"CheckID\": "));
-        else if (field_id == 0x50019UL) append(APPENDPARAMS, SBUF("\"ValidatedHash\": "));
-        else if (field_id == 0x60001UL) append(APPENDPARAMS, SBUF("\"Amount\": "));
-        else if (field_id == 0x60002UL) append(APPENDPARAMS, SBUF("\"Balance\": "));
-        else if (field_id == 0x60003UL) append(APPENDPARAMS, SBUF("\"LimitAmount\": "));
-        else if (field_id == 0x60004UL) append(APPENDPARAMS, SBUF("\"TakerPays\": "));
-        else if (field_id == 0x60005UL) append(APPENDPARAMS, SBUF("\"TakerGets\": "));
-        else if (field_id == 0x60006UL) append(APPENDPARAMS, SBUF("\"LowLimit\": "));
-        else if (field_id == 0x60007UL) append(APPENDPARAMS, SBUF("\"HighLimit\": "));
-        else if (field_id == 0x60008UL) append(APPENDPARAMS, SBUF("\"Fee\": "));
-        else if (field_id == 0x60009UL) append(APPENDPARAMS, SBUF("\"SendMax\": "));
-        else if (field_id == 0x6000aUL) append(APPENDPARAMS, SBUF("\"DeliverMin\": "));
-        else if (field_id == 0x60010UL) append(APPENDPARAMS, SBUF("\"MinimumOffer\": "));
-        else if (field_id == 0x60011UL) append(APPENDPARAMS, SBUF("\"RippleEscrow\": "));
-        else if (field_id == 0x60012UL) append(APPENDPARAMS, SBUF("\"DeliveredAmount\": "));
-        else if (field_id == 0x70001UL) append(APPENDPARAMS, SBUF("\"PublicKey\": "));
-        else if (field_id == 0x70002UL) append(APPENDPARAMS, SBUF("\"MessageKey\": "));
-        else if (field_id == 0x70003UL) append(APPENDPARAMS, SBUF("\"SigningPubKey\": "));
-        else if (field_id == 0x70004UL) append(APPENDPARAMS, SBUF("\"TxnSignature\": "));
-        else if (field_id == 0x70006UL) append(APPENDPARAMS, SBUF("\"Signature\": "));
-        else if (field_id == 0x70007UL) append(APPENDPARAMS, SBUF("\"Domain\": "));
-        else if (field_id == 0x70008UL) append(APPENDPARAMS, SBUF("\"FundCode\": "));
-        else if (field_id == 0x70009UL) append(APPENDPARAMS, SBUF("\"RemoveCode\": "));
-        else if (field_id == 0x7000aUL) append(APPENDPARAMS, SBUF("\"ExpireCode\": "));
-        else if (field_id == 0x7000bUL) append(APPENDPARAMS, SBUF("\"CreateCode\": "));
-        else if (field_id == 0x7000cUL) append(APPENDPARAMS, SBUF("\"MemoType\": "));
-        else if (field_id == 0x7000dUL) append(APPENDPARAMS, SBUF("\"MemoData\": "));
-        else if (field_id == 0x7000eUL) append(APPENDPARAMS, SBUF("\"MemoFormat\": "));
-        else if (field_id == 0x70010UL) append(APPENDPARAMS, SBUF("\"Fulfillment\": "));
-        else if (field_id == 0x70011UL) append(APPENDPARAMS, SBUF("\"Condition\": "));
-        else if (field_id == 0x70012UL) append(APPENDPARAMS, SBUF("\"MasterSignature\": "));
-        else if (field_id == 0x70013UL) append(APPENDPARAMS, SBUF("\"UNLModifyValidator\": "));
-        else if (field_id == 0x70014UL) append(APPENDPARAMS, SBUF("\"NegativeUNLToDisable\": "));
-        else if (field_id == 0x70015UL) append(APPENDPARAMS, SBUF("\"NegativeUNLToReEnable\": "));
-        else if (field_id == 0x70016UL) append(APPENDPARAMS, SBUF("\"HookData\": "));
-        else if (field_id == 0x80001UL) append(APPENDPARAMS, SBUF("\"Account\": "));
-        else if (field_id == 0x80002UL) append(APPENDPARAMS, SBUF("\"Owner\": "));
-        else if (field_id == 0x80003UL) append(APPENDPARAMS, SBUF("\"Destination\": "));
-        else if (field_id == 0x80004UL) append(APPENDPARAMS, SBUF("\"Issuer\": "));
-        else if (field_id == 0x80005UL) append(APPENDPARAMS, SBUF("\"Authorize\": "));
-        else if (field_id == 0x80006UL) append(APPENDPARAMS, SBUF("\"Unauthorize\": "));
-        else if (field_id == 0x80007UL) append(APPENDPARAMS, SBUF("\"Target\": "));
-        else if (field_id == 0x80008UL) append(APPENDPARAMS, SBUF("\"RegularKey\": "));
-        else if (field_id == 0x120001UL) append(APPENDPARAMS, SBUF("\"Paths\": "));
-        else if (field_id == 0x130001UL) append(APPENDPARAMS, SBUF("\"Indexes\": "));
-        else if (field_id == 0x130002UL) append(APPENDPARAMS, SBUF("\"Hashes\": "));
-        else if (field_id == 0x130003UL) append(APPENDPARAMS, SBUF("\"Amendments\": "));
-        else if (field_id == 0xe0002UL) append(APPENDPARAMS, SBUF("\"TransactionMetaData\": "));
-        else if (field_id == 0xe0003UL) append(APPENDPARAMS, SBUF("\"CreatedNode\": "));
-        else if (field_id == 0xe0004UL) append(APPENDPARAMS, SBUF("\"DeletedNode\": "));
-        else if (field_id == 0xe0005UL) append(APPENDPARAMS, SBUF("\"ModifiedNode\": "));
-        else if (field_id == 0xe0006UL) append(APPENDPARAMS, SBUF("\"PreviousFields\": "));
-        else if (field_id == 0xe0007UL) append(APPENDPARAMS, SBUF("\"FinalFields\": "));
-        else if (field_id == 0xe0008UL) append(APPENDPARAMS, SBUF("\"NewFields\": "));
-        else if (field_id == 0xe0009UL) append(APPENDPARAMS, SBUF("\"TemplateEntry\": "));
-        else if (field_id == 0xe000aUL) append(APPENDPARAMS, SBUF("\"Memo\": "));
-        else if (field_id == 0xe000bUL) append(APPENDPARAMS, SBUF("\"SignerEntry\": "));
-        else if (field_id == 0xe000cUL) append(APPENDPARAMS, SBUF("\"EmitDetails\": "));
-        else if (field_id == 0xe0010UL) append(APPENDPARAMS, SBUF("\"Signer\": "));
-        else if (field_id == 0xe0012UL) append(APPENDPARAMS, SBUF("\"Majority\": "));
-        else if (field_id == 0xe0013UL) append(APPENDPARAMS, SBUF("\"NegativeUNLEntry\": "));
-        else if (field_id == 0xf0002UL) append(APPENDPARAMS, SBUF("\"SigningAccounts\": "));
-        else if (field_id == 0xf0003UL) append(APPENDPARAMS, SBUF("\"Signers\": "));
-        else if (field_id == 0xf0004UL) append(APPENDPARAMS, SBUF("\"SignerEntries\": "));
-        else if (field_id == 0xf0005UL) append(APPENDPARAMS, SBUF("\"Template\": "));
-        else if (field_id == 0xf0006UL) append(APPENDPARAMS, SBUF("\"Necessary\": "));
-        else if (field_id == 0xf0007UL) append(APPENDPARAMS, SBUF("\"Sufficient\": "));
-        else if (field_id == 0xf0008UL) append(APPENDPARAMS, SBUF("\"AffectedNodes\": "));
-        else if (field_id == 0xf0009UL) append(APPENDPARAMS, SBUF("\"Memos\": "));
-        else if (field_id == 0xf0010UL) append(APPENDPARAMS, SBUF("\"Majorities\": "));
-        else if (field_id == 0xf0011UL) append(APPENDPARAMS, SBUF("\"NegativeUNL\": "));
-        else if (field_id == 0xE0001UL || field_id == 0xF0001UL)
+        if (!end_of_object)
         {
-            // do nothing (end of object/array)
-        }
-        else
-        {
-            fprintf(stderr, "Error: Unknown field_id %05X\n", field_id);
-            break;
+            // Unknown fields of a known type are still decoded (the wire
+            // format only depends on the type), just under a placeholder name.
+            char key[96];
+            const char* fname = xd_field_name(type_code, field_code);
+            if (fname)
+                snprintf(key, sizeof(key), "\"%s\": ", fname);
+            else
+                snprintf(key, sizeof(key), "\"UnknownField_%d_%d\": ", type_code, field_code);
+            APPENDS(APPENDPARAMS, key);
         }
 
         if (type_code == 18)
@@ -596,16 +571,19 @@ int deserialize(
             append(APPENDPARAMS, SBUF("[\n"));
             indent_level++;
 
+            int paths_complete = 0;
             for (int path_count = 0; 1; ++path_count)
             {
+                REQUIRE(1);
                 uint8_t path_type = *n;
                 ADVANCE(1);
                 
-                //printf("\nPATH TYPE: %02X\n", path_type);
                 if (path_type == 0x00U)
+                {
+                    paths_complete = 1;
                     break;
+                }
 
-                
                 if (path_type == 0xFFU)
                 {
                     append(APPENDNOINDENT, SBUF("\n"));
@@ -617,101 +595,81 @@ int deserialize(
                     continue;
                 }
 
+                if (path_type & ~0x71U)
+                {
+                    fprintf(stderr, "Error: bad path element type 0x%02X\n", path_type);
+                    break;
+                }
+
+                int has_account = path_type & 0x01U;
+                int has_currency = path_type & 0x10U;
+                int has_issuer = path_type & 0x20U;
+                int has_mpt = path_type & 0x40U;
+
+                int need = (has_account ? 20 : 0) + (has_currency ? 20 : 0) + (has_mpt ? 24 : 0) + (has_issuer ? 20 : 0);
+                REQUIRE(need);
+
                 if (path_count > 0)
                     append(APPENDNOINDENT, SBUF(",\n"));
 
                 append(APPENDPARAMS, SBUF("{\n"));
                 indent_level++;
 
-                char path_type_str[128];
-                int l = snprintf(path_type_str, 128, "\"type\": %d,\n", path_type);
-                append(APPENDPARAMS, path_type_str, l);
+                char line[160];
+                snprintf(line, sizeof(line), "\"type\": %d", path_type);
+                APPENDS(APPENDPARAMS, line);
 
-
-                if (path_type & 0x01U)
+                if (has_account)
                 {
-                    REQUIRE(20);
-                    path_type -= 0x01U;
-
-                    // account
-                    append(APPENDPARAMS, SBUF("\"account\": \""));
                     char acc[64];
-                    size_t acc_size = 64;
-                    if (!b58check_enc(acc, &acc_size, 0, n, 20))
+                    if (!xd_account(acc, sizeof(acc), n))
                     {
                         fprintf(stderr, "Error: could not base58 encode\n");
                         return 0;
                     }
-                    acc[0] = 'r';
-                    append(APPENDNOINDENT, acc, acc_size);
-                    if (path_type)
-                        append(APPENDNOINDENT, SBUF("\",\n"));
-                    else
-                        append(APPENDNOINDENT, SBUF("\"\n"));
-
+                    snprintf(line, sizeof(line), ",\n");
+                    APPENDS(APPENDNOINDENT, line);
+                    snprintf(line, sizeof(line), "\"account\": \"%s\"", acc);
+                    APPENDS(APPENDPARAMS, line);
                     ADVANCE(20);
-               }
+                }
 
-                if (path_type & 0x10U)
+                if (has_currency)
                 {
-                    // currency
-                    path_type -= 0x10U;
-
-                    append(APPENDPARAMS, SBUF("\"currency\": \""));
-
-                    REQUIRE(20);
                     char currency[41];
-                    uint64_t* c = (uint64_t*)(n);
-
-                    if (!c[0] && !c[1] && !*((uint32_t*)(n + 16)))
-                    {
-                        currency[0] = 'X';
-                        currency[1] = 'R';
-                        currency[2] = 'P';
-                        currency[3] = '\0';
-                    }
-                    else if (is_ascii_currency(n))
-                    {
-                        currency[0] = n[12];
-                        currency[1] = n[13];
-                        currency[2] = n[14];
-                        currency[3] = '\0';
-                    }
-                    else
-                        HEX(currency, n, 20);
-                    
-                    currency[40] = '\0';
-
-                    append(APPENDNOINDENT, currency, 40);
-                    
-                    if (path_type)
-                        append(APPENDNOINDENT, SBUF("\",\n"));
-                    else
-                        append(APPENDNOINDENT, SBUF("\"\n"));
-
+                    xd_currency(currency, n);
+                    APPENDS(APPENDNOINDENT, ",\n");
+                    snprintf(line, sizeof(line), "\"currency\": \"%s\"", currency);
+                    APPENDS(APPENDPARAMS, line);
                     ADVANCE(20);
                 }
 
-                if (path_type & 0x20U)
+                if (has_mpt)
                 {
-                    // issuer
-                    REQUIRE(20);
+                    char hex[49];
+                    HEX(hex, n, 24);
+                    hex[48] = '\0';
+                    APPENDS(APPENDNOINDENT, ",\n");
+                    snprintf(line, sizeof(line), "\"mpt_issuance_id\": \"%s\"", hex);
+                    APPENDS(APPENDPARAMS, line);
+                    ADVANCE(24);
+                }
 
-                    // account
-                    append(APPENDPARAMS, SBUF("\"issuer\": \""));
+                if (has_issuer)
+                {
                     char acc[64];
-                    size_t acc_size = 64;
-                    if (!b58check_enc(acc, &acc_size, 0, n, 20))
+                    if (!xd_account(acc, sizeof(acc), n))
                     {
                         fprintf(stderr, "Error: could not base58 encode\n");
                         return 0;
                     }
-                    acc[0] = 'r';
-                    append(APPENDNOINDENT, acc, acc_size);
-                    append(APPENDNOINDENT, SBUF("\"\n"));
+                    APPENDS(APPENDNOINDENT, ",\n");
+                    snprintf(line, sizeof(line), "\"issuer\": \"%s\"", acc);
+                    APPENDS(APPENDPARAMS, line);
                     ADVANCE(20);
                 }
 
+                append(APPENDNOINDENT, SBUF("\n"));
                 indent_level--;
                 append(APPENDPARAMS, SBUF("}"));
 
@@ -720,7 +678,10 @@ int deserialize(
             indent_level--;
             append(APPENDPARAMS, SBUF("]\n"));
             indent_level--;
-            append(APPENDPARAMS, SBUF("]\n"));
+            append(APPENDPARAMS, SBUF("]"));
+
+            if (!paths_complete)
+                break;  // malformed or truncated (REQUIRE only exits the inner loop)
 
         }
         else if (type_code == 14)
@@ -772,69 +733,61 @@ int deserialize(
                 parent_is_array |= 1U;
             }
         }
-        else if (type_code == 8) // account
+        else if (type_code == 8) // account (variable length, always 20 bytes in practice)
         {
+            int acc_len = 0;
+            READ_VL(acc_len);
+            REQUIRE(acc_len);
 
-         //   printf("upto: %d, remaining: %d\n", upto, remaining);
-            REQUIRE(21);
-
-            char acc[64];
-            size_t acc_size = 64;
-            if (!b58check_enc(acc, &acc_size, 0, n + 1, 20))
+            if (acc_len == 20)
             {
-                fprintf(stderr, "Error: could not base58 encode\n");
-                return 0;
-            }
-            acc[0] = 'r';
-            append(APPENDNOINDENT, SBUF("\""));
-            append(APPENDNOINDENT, acc, acc_size);
-            append(APPENDNOINDENT, SBUF("\""));
-            ADVANCE(21);
-        }
-        else if (type_code == 4 || type_code == 5 || type_code == 17)
-        {
-            // uint128, uint256, uint160
-            REQUIRE(size);
-            
-            append(APPENDNOINDENT, SBUF("\""));
-            char hexout[513];
-            HEX(hexout, n, size);
-            append(APPENDNOINDENT, hexout, size*2);
-            append(APPENDNOINDENT, SBUF("\""));
-
-            ADVANCE(size);    
-        }
-        else if (type_code == 7 || type_code == 19) // blob
-        {
-            int64_t field_len = *n;
-            if (field_len <= 192)
-            {
-                // one byte size
-                ADVANCE(1);
-            }
-            else if (field_len <= 12480)
-            {
-                // two byte size
-                REQUIRE(2);
-                field_len = 193 + ((field_len - 193) * 256) + *(n+1);
-                ADVANCE(2);
+                char acc[64];
+                if (!xd_account(acc, sizeof(acc), n))
+                {
+                    fprintf(stderr, "Error: could not base58 encode\n");
+                    return 0;
+                }
+                append(APPENDNOINDENT, SBUF("\""));
+                APPENDS(APPENDNOINDENT, acc);
+                append(APPENDNOINDENT, SBUF("\""));
             }
             else
             {
-                // three byte size
-                REQUIRE(3);
-                field_len = 12481 + ((field_len - 241) * 0xFFFFU) + ((*(n+1)) * 256) + *(n+2);
-                ADVANCE(3);
+                // not a valid account, show what is there
+                char hexout[2 * 192 + 1];
+                int l = acc_len > 192 ? 192 : (int)acc_len;
+                HEX(hexout, n, l);
+                hexout[2 * l] = '\0';
+                append(APPENDNOINDENT, SBUF("\""));
+                APPENDS(APPENDNOINDENT, hexout);
+                append(APPENDNOINDENT, SBUF("\""));
             }
+            ADVANCE(acc_len);
+        }
+        else if (hex_size > 0)
+        {
+            // uint96 .. uint512
+            REQUIRE(hex_size);
+            
+            append(APPENDNOINDENT, SBUF("\""));
+            char hexout[129];
+            HEX(hexout, n, hex_size);
+            append(APPENDNOINDENT, hexout, hex_size*2);
+            append(APPENDNOINDENT, SBUF("\""));
 
-            //printf("vl len: %d\n", field_len);
+            ADVANCE(hex_size);    
+        }
+        else if (type_code == 7) // blob
+        {
+            int field_len = 0;
+            READ_VL(field_len);
             REQUIRE(field_len);
 
             append(APPENDNOINDENT, SBUF("\""));
             char hexout[1024];
             int already_printed = 0;
             int to_print = field_len - already_printed;
-            do
+            while (to_print > 0)
             {
                 if (to_print > sizeof(hexout)/2)
                     to_print = sizeof(hexout)/2;
@@ -842,203 +795,246 @@ int deserialize(
                 append(APPENDNOINDENT, hexout, to_print*2);
                 already_printed += to_print;
                 to_print = field_len - already_printed;
-            } while (to_print > 0);
+            }
 
             append(APPENDNOINDENT, SBUF("\""));
 
             ADVANCE(field_len);
         }
+        else if (type_code == 19) // vector256
+        {
+            int field_len = 0;
+            READ_VL(field_len);
+            REQUIRE(field_len);
+
+            if (field_len % 32 != 0)
+            {
+                fprintf(stderr, "Error: Vector256 length %d is not a multiple of 32\n", (int)field_len);
+                break;
+            }
+
+            append(APPENDNOINDENT, SBUF("[\n"));
+            for (int i = 0; i < field_len / 32; ++i)
+            {
+                char hexout[68];
+                hexout[0] = '"';
+                HEX(hexout + 1, n + i * 32, 32);
+                hexout[65] = '"';
+                hexout[66] = '\0';
+                if (i > 0)
+                    append(APPENDNOINDENT, SBUF(",\n"));
+                append(indent_level + 1, output, &upto, &len, write_fd, hexout, 67);
+            }
+            if (field_len > 0)
+                append(APPENDNOINDENT, SBUF("\n"));
+            append(APPENDPARAMS, SBUF("]"));
+
+            ADVANCE(field_len);
+        }
         else if (type_code == 6) // amount
         {
+            REQUIRE(1);
             if ((*n) >> 7U)
             {
-                size = 48U;
+                // issued currency
                 REQUIRE(48);
-                uint16_t exponent = (((uint16_t)(*n)) << 8U) +
-                                    (uint16_t)(*(n+1));
-                exponent &= 0b0011111111000000;
-                exponent >>= 6U;
-                char str[1024];
-                int is_neg = (((*n) >> 6U) & 1U == 0);
-                uint64_t mantissa = 
-                    (((uint64_t)((*(n+1) & 0b111111))) << 48U) +
-                    (((uint64_t)((*(n+2)))) << 40U) +
-                    (((uint64_t)((*(n+3)))) << 32U) +
-                    (((uint64_t)((*(n+4)))) << 24U) +
-                    (((uint64_t)((*(n+5)))) << 16U) +
-                    (((uint64_t)((*(n+6)))) <<  8U) +
-                    (((uint64_t)((*(n+7)))) <<  0U);
-                int ascii = is_ascii_currency(n+8);
+                int is_neg = ((*n >> 6U) & 1U) == 0;
+                int32_t exp = (int32_t)(((((uint16_t)(*n)) << 8U) | (uint16_t)(*(n+1))) >> 6U & 0xFFU) - 97;
+                uint64_t mantissa = be64(n) & 0x003FFFFFFFFFFFFFULL;
+
+                char currency[41];
+                xd_currency(currency, n + 8);
+
                 char issuer[64];
-                size_t issuer_size = 64;
-                if (!b58check_enc(issuer, &issuer_size, 0, n + 28, 20))
+                if (!xd_account(issuer, sizeof(issuer), n + 28))
                 {
                     fprintf(stderr, "Error: could not base58 encode\n");
                     return 0;
                 }
-                issuer[0] = 'r';
-                char currency[41];
-                currency[40] = '\0'; 
-                uint64_t* c = (uint64_t*)(n + 8);
-                if (!c[0] && !c[1] && !*((uint32_t*)(n + 8 + 16)))
-                {
-                    currency[0] = 'X';
-                    currency[1] = 'R';
-                    currency[2] = 'P';
-                    currency[3] = '\0';
-                }
-                else if (ascii)
-                {
-                    for (int i = 0; i < 3; ++i)
-                        currency[i] = (char)(*(n + 8 + 12 + i));
-                    currency[3] = '\0';
-                }
-                else
-                {
-                    for (int i = 0; i < 20; ++i)
-                    {
-                        unsigned char hi = (*(n+8+i)) >> 4U;
-                        unsigned char lo = (*(n+8+i)) & 0xFU;
-                        hi += (hi > 9 ? 'A' - 10 : '0');
-                        lo += (lo > 9 ? 'A' - 10 : '0');
-                        currency[i*2+0] = (char)hi;
-                        currency[i*2+1] = (char)lo;
-                    }
-                }
-                int32_t exp = (int32_t)(exponent);
-                exp -= 97;
+
+                char str[1024];
+                uint8_t fixed[128];
+                if (to_fixed_point(fixed, sizeof(fixed), mantissa, exp, is_neg && mantissa) == -1)
+                    snprintf((char*)fixed, sizeof(fixed), "\"%s%llue%d\"",
+                            (is_neg ? "-" : ""), (unsigned long long)mantissa, exp);
+
                 append(APPENDNOINDENT, SBUF("{\n"));
-//                snprintf(str, 1024, "\t\"value\": \"%s%lluE%d\",\n", (is_neg ? "-" : ""), mantissa, exp);
-                {
-                    uint8_t fixed[128];
-                    
-                    if (to_fixed_point(fixed, 128, mantissa, exp, is_neg) == -1)
-                        return fprintf(stderr, "Error: could not convert mantissa/exp to fixed point %lluE%d\n", mantissa, exp);
-
-                    snprintf(str, 1024, "\t\"value\": %s,\n", fixed);
-                    append(APPENDPARAMS, str, 1024);
-                }
-
-                append(APPENDPARAMS, SBUF("\t\"currency\": \""));
-                append(APPENDNOINDENT, SBUF(currency));
-                append(APPENDNOINDENT, SBUF("\",\n"));
-                append(APPENDPARAMS, SBUF("\t\"issuer\": \""));
-                append(APPENDNOINDENT, SBUF(issuer));
-                append(APPENDNOINDENT, SBUF("\"\n"));
+                snprintf(str, sizeof(str), "\t\"value\": %s,\n", fixed);
+                APPENDS(APPENDPARAMS, str);
+                snprintf(str, sizeof(str), "\t\"currency\": \"%s\",\n", currency);
+                APPENDS(APPENDPARAMS, str);
+                snprintf(str, sizeof(str), "\t\"issuer\": \"%s\"\n", issuer);
+                APPENDS(APPENDPARAMS, str);
                 append(APPENDPARAMS, SBUF("}"));
                 ADVANCE(48);
             }
+            else if ((*n) & 0x20U)
+            {
+                // MPT amount: flags(1) | value(8) | MPTID(24)
+                REQUIRE(33);
+                int is_neg = ((*n >> 6U) & 1U) == 0;
+                uint64_t value = be64(n + 1);
+                char id[49];
+                HEX(id, n + 9, 24);
+                id[48] = '\0';
+
+                char str[256];
+                append(APPENDNOINDENT, SBUF("{\n"));
+                snprintf(str, sizeof(str), "\t\"mpt_issuance_id\": \"%s\",\n", id);
+                APPENDS(APPENDPARAMS, str);
+                snprintf(str, sizeof(str), "\t\"value\": \"%s%llu\"\n",
+                        (is_neg && value ? "-" : ""), (unsigned long long)value);
+                APPENDS(APPENDPARAMS, str);
+                append(APPENDPARAMS, SBUF("}"));
+                ADVANCE(33);
+            }
             else
             {
+                // native
                 REQUIRE(8);
-                char str[24];
-                int negative =  ((*n) >> 6U == 0);
-                uint64_t number =  
-                    ((uint64_t)((*n) & 0b111111U) << 56U) + 
-                    ((uint64_t)(*(n+1)) << 48U) + 
-                    ((uint64_t)(*(n+2)) << 40U) + 
-                    ((uint64_t)(*(n+3)) << 32U) + 
-                    ((uint64_t)(*(n+4)) << 24U) + 
-                    ((uint64_t)(*(n+5)) << 16U) + 
-                    ((uint64_t)(*(n+6)) <<  8U) + 
-                    ((uint64_t)(*(n+7)) <<  0U);
-                int l = snprintf(str, 23, "\"%s%llu\"", (negative ? "-" : ""), number); 
-                append(APPENDNOINDENT, str, l);
+                char str[32];
+                int negative = ((*n) >> 6U == 0);
+                uint64_t number = be64(n) & 0x3FFFFFFFFFFFFFFFULL;
+                int l = snprintf(str, sizeof(str), "\"%s%llu\"", (negative ? "-" : ""), (unsigned long long)number); 
+                append(APPENDNOINDENT, str, l + 1);
                 ADVANCE(8);
             }
         }
-        else if (type_code == 1 || type_code == 2 || type_code == 3 || type_code == 16) // uint16
+        else if (type_code == 9) // number: int64 mantissa, int32 exponent
+        {
+            REQUIRE(12);
+            int64_t m = (int64_t)be64(n);
+            int32_t e = (int32_t)be32(n + 8);
+            int neg = m < 0;
+            uint64_t um = neg ? (uint64_t)(-(m + 1)) + 1U : (uint64_t)m;
+
+            uint8_t fixed[128];
+            if (to_fixed_point(fixed, sizeof(fixed), um, e, neg) == -1)
+                snprintf((char*)fixed, sizeof(fixed), "\"%s%llue%d\"", (neg ? "-" : ""), (unsigned long long)um, e);
+            APPENDS(APPENDNOINDENT, (char*)fixed);
+            ADVANCE(12);
+        }
+        else if (type_code == 24) // issue
+        {
+            REQUIRE(20);
+            if (!is_zero(n, 20))
+            {
+                REQUIRE(40);
+                if (is_no_account(n + 20))
+                    REQUIRE(44);
+            }
+            char str[512];
+            int used = xd_issue_json(str, sizeof(str), n, indent_level);
+            if (used < 0)
+            {
+                fprintf(stderr, "Error: could not decode Issue\n");
+                return 0;
+            }
+            APPENDS(APPENDNOINDENT, str);
+            ADVANCE(used);
+        }
+        else if (type_code == 25) // xchain bridge: account, issue, account, issue
+        {
+            int off = 0, sides_done = 0;
+            int door[2], issue[2];
+            for (int side = 0; side < 2; ++side)
+            {
+                REQUIRE(off + 1);
+                if (n[off] != 20)
+                {
+                    fprintf(stderr, "Error: unexpected XChainBridge door account length %d\n", n[off]);
+                    off = -1;
+                    break;
+                }
+                door[side] = off + 1;
+                off += 21;
+                REQUIRE(off + 20);
+                if (!is_zero(n + off, 20))
+                {
+                    REQUIRE(off + 40);
+                    if (is_no_account(n + off + 20))
+                        REQUIRE(off + 44);
+                }
+                issue[side] = off;
+                off += xd_issue_len(n + off);
+                sides_done = side + 1;
+            }
+            if (off < 0 || sides_done != 2)
+                break;  // malformed or truncated (REQUIRE only exits the inner loop)
+
+            static const char* names[2][2] = {
+                { "LockingChainDoor", "LockingChainIssue" },
+                { "IssuingChainDoor", "IssuingChainIssue" } };
+            char t1[32];
+            xd_tabs(t1, indent_level + 1);
+            append(APPENDNOINDENT, SBUF("{\n"));
+            for (int side = 0; side < 2; ++side)
+            {
+                char acc[64], iss[512], str[700];
+                if (!xd_account(acc, sizeof(acc), n + door[side]) ||
+                    xd_issue_json(iss, sizeof(iss), n + issue[side], indent_level + 1) < 0)
+                {
+                    fprintf(stderr, "Error: could not decode XChainBridge\n");
+                    return 0;
+                }
+                snprintf(str, sizeof(str), "%s\"%s\": \"%s\",\n%s\"%s\": %s%s\n",
+                        t1, names[side][0], acc, t1, names[side][1], iss, side == 0 ? "," : "");
+                APPENDS(APPENDNOINDENT, str);
+            }
+            append(APPENDPARAMS, SBUF("}"));
+            ADVANCE(off);
+        }
+        else if (type_code == 26) // currency
+        {
+            REQUIRE(20);
+            char currency[41], str[48];
+            xd_currency(currency, n);
+            snprintf(str, sizeof(str), "\"%s\"", currency);
+            APPENDS(APPENDNOINDENT, str);
+            ADVANCE(20);
+        }
+        else // uint8, uint16, uint32, uint64, int32, int64
         {
             uint64_t number = 0;
+            int64_t snumber = 0;
+            int is_signed = 0;
+            const char* name = 0;
+
             if (type_code == 1) // uint16
             {
                 REQUIRE(2);
-                number =  (((uint64_t)(*(n+0))) << 8U) + 
-                          (((uint64_t)(*(n+1))) << 0U);
+                number = ((uint64_t)(*(n+0)) << 8U) + (uint64_t)(*(n+1));
                 ADVANCE(2);
 
-                int skip_print = 1;
                 if (field_code == 2)
-                {
-                    // transaction type
-                    if (number == 21) append(APPENDNOINDENT, SBUF("\"AccountDelete\""));
-                    else if (number == 3) append(APPENDNOINDENT, SBUF("\"AccountSet\""));
-                    else if (number == 18) append(APPENDNOINDENT, SBUF("\"CheckCancel\""));
-                    else if (number == 17) append(APPENDNOINDENT, SBUF("\"CheckCash\""));
-                    else if (number == 16) append(APPENDNOINDENT, SBUF("\"CheckCreate\""));
-                    else if (number == 9) append(APPENDNOINDENT, SBUF("\"Contract\""));
-                    else if (number == 19) append(APPENDNOINDENT, SBUF("\"DepositPreauth\""));
-                    else if (number == 100) append(APPENDNOINDENT, SBUF("\"EnableAmendment\""));
-                    else if (number == 4) append(APPENDNOINDENT, SBUF("\"EscrowCancel\""));
-                    else if (number == 1) append(APPENDNOINDENT, SBUF("\"EscrowCreate\""));
-                    else if (number == 2) append(APPENDNOINDENT, SBUF("\"EscrowFinish\""));
-                    else if (number == 6) append(APPENDNOINDENT, SBUF("\"NickNameSet\""));
-                    else if (number == 8) append(APPENDNOINDENT, SBUF("\"OfferCancel\""));
-                    else if (number == 7) append(APPENDNOINDENT, SBUF("\"OfferCreate\""));
-                    else if (number == 0) append(APPENDNOINDENT, SBUF("\"Payment\""));
-                    else if (number == 15) append(APPENDNOINDENT, SBUF("\"PaymentChannelClaim\""));
-                    else if (number == 13) append(APPENDNOINDENT, SBUF("\"PaymentChannelCreate\""));
-                    else if (number == 14) append(APPENDNOINDENT, SBUF("\"PaymentChannelFund\""));
-                    else if (number == 101) append(APPENDNOINDENT, SBUF("\"SetFee\""));
-                    else if (number == 5) append(APPENDNOINDENT, SBUF("\"SetRegularKey\""));
-                    else if (number == 12) append(APPENDNOINDENT, SBUF("\"SignerListSet\""));
-                    else if (number == 11) append(APPENDNOINDENT, SBUF("\"TicketCancel\""));
-                    else if (number == 10) append(APPENDNOINDENT, SBUF("\"TicketCreate\""));
-                    else if (number == 20) append(APPENDNOINDENT, SBUF("\"TrustSet\""));
-                    else if (number == 102) append(APPENDNOINDENT, SBUF("\"UNLModify\""));
-                    else
-                        skip_print = 0;
-
-                }
+                    name = xd_tx_name((int)number);       // TransactionType
                 else if (field_code == 1)
-                {
-                    // ledger type
-                    if (number == (uint16_t)('a')) append(APPENDNOINDENT, SBUF("\"AccountRoot\""));
-                    else if (number == (uint16_t)('f')) append(APPENDNOINDENT, SBUF("\"Ammendments\""));
-                    else if (number == (uint16_t)('C')) append(APPENDNOINDENT, SBUF("\"Check\""));
-                    else if (number == (uint16_t)('p')) append(APPENDNOINDENT, SBUF("\"DepositPreauth\""));
-                    else if (number == (uint16_t)('d')) append(APPENDNOINDENT, SBUF("\"DirectoryNode\""));
-                    else if (number == (uint16_t)('u')) append(APPENDNOINDENT, SBUF("\"Escrow\""));
-                    else if (number == (uint16_t)('s')) append(APPENDNOINDENT, SBUF("\"FeeSettings\""));
-                    else if (number == (uint16_t)('h')) append(APPENDNOINDENT, SBUF("\"LedgerHashes\""));
-                    else if (number == (uint16_t)('N')) append(APPENDNOINDENT, SBUF("\"NegativeUNL\""));
-                    else if (number == (uint16_t)('o')) append(APPENDNOINDENT, SBUF("\"Offer\""));
-                    else if (number == (uint16_t)('x')) append(APPENDNOINDENT, SBUF("\"PayChan\""));
-                    else if (number == (uint16_t)('r')) append(APPENDNOINDENT, SBUF("\"RippleState\""));
-                    else if (number == (uint16_t)('S')) append(APPENDNOINDENT, SBUF("\"SignerList\""));
-                    else if (number == (uint16_t)('T')) append(APPENDNOINDENT, SBUF("\"Ticket\""));
-                    else
-                        skip_print = 0;
-                }
-                else
-                    skip_print = 0;
-            
-                if (skip_print)
-                    continue;
+                    name = xd_le_name((int)number);       // LedgerEntryType
             }
             else if (type_code == 2) // uint32
             {
                 REQUIRE(4);
-                number = 
-                    (((uint64_t)(*(n+0))) << 24U) +
-                    (((uint64_t)(*(n+1))) << 16U) +
-                    (((uint64_t)(*(n+2))) << 8U ) +
-                    (((uint64_t)(*(n+3))) << 0U );
-
+                number = be32(n);
                 ADVANCE(4);
             }
             else if (type_code == 3) // uint64
             {
                 REQUIRE(8);
-                number = 
-                    (((uint64_t)(*(n+0))) << 56U) +
-                    (((uint64_t)(*(n+1))) << 48U) +
-                    (((uint64_t)(*(n+2))) << 40U ) +
-                    (((uint64_t)(*(n+3))) << 32U ) +
-                    (((uint64_t)(*(n+4))) << 24U) +
-                    (((uint64_t)(*(n+5))) << 16U) +
-                    (((uint64_t)(*(n+6))) << 8U ) +
-                    (((uint64_t)(*(n+7))) << 0U );
+                number = be64(n);
+                ADVANCE(8);
+            }
+            else if (type_code == 10) // int32
+            {
+                REQUIRE(4);
+                snumber = (int32_t)be32(n);
+                is_signed = 1;
+                ADVANCE(4);
+            }
+            else if (type_code == 11) // int64
+            {
+                REQUIRE(8);
+                snumber = (int64_t)be64(n);
+                is_signed = 1;
                 ADVANCE(8);
             }
             else // uint8
@@ -1047,62 +1043,18 @@ int deserialize(
                 number = *n;
                 ADVANCE(1);
 
-                int skip_print = 1;
-
                 if (field_code == 3)
-                {
-                    // tx result
-                    if (number == 100) append(APPENDNOINDENT, SBUF("\"tecCLAIM\""));
-                    else if (number == 146) append(APPENDNOINDENT, SBUF("\"tecCRYPTOCONDITION_ERROR\""));
-                    else if (number == 121) append(APPENDNOINDENT, SBUF("\"tecDIR_FULL\""));
-                    else if (number == 143) append(APPENDNOINDENT, SBUF("\"tecDST_TAG_NEEDED\""));
-                    else if (number == 149) append(APPENDNOINDENT, SBUF("\"tecDUPLICATE\""));
-                    else if (number == 148) append(APPENDNOINDENT, SBUF("\"tecEXPIRED\""));
-                    else if (number == 105) append(APPENDNOINDENT, SBUF("\"tecFAILED_PROCESSING\""));
-                    else if (number == 137) append(APPENDNOINDENT, SBUF("\"tecFROZEN\""));
-                    else if (number == 151) append(APPENDNOINDENT, SBUF("\"tecHAS_OBLIGATIONS\""));
-                    else if (number == 136) append(APPENDNOINDENT, SBUF("\"tecINSUFF_FEE\""));
-                    else if (number == 141) append(APPENDNOINDENT, SBUF("\"tecINSUFFICIENT_RESERVE\""));
-                    else if (number == 122) append(APPENDNOINDENT, SBUF("\"tecINSUF_RESERVE_LINE\""));
-                    else if (number == 123) append(APPENDNOINDENT, SBUF("\"tecINSUF_RESERVE_OFFER\""));
-                    else if (number == 144) append(APPENDNOINDENT, SBUF("\"tecINTERNAL\""));
-                    else if (number == 147) append(APPENDNOINDENT, SBUF("\"tecINVARIANT_FAILED\""));
-                    else if (number == 150) append(APPENDNOINDENT, SBUF("\"tecKILLED\""));
-                    else if (number == 142) append(APPENDNOINDENT, SBUF("\"tecNEED_MASTER_KEY\""));
-                    else if (number == 130) append(APPENDNOINDENT, SBUF("\"tecNO_ALTERNATIVE_KEY\""));
-                    else if (number == 134) append(APPENDNOINDENT, SBUF("\"tecNO_AUTH\""));
-                    else if (number == 124) append(APPENDNOINDENT, SBUF("\"tecNO_DST\""));
-                    else if (number == 125) append(APPENDNOINDENT, SBUF("\"tecNO_DST_INSUF_XRP\""));
-                    else if (number == 140) append(APPENDNOINDENT, SBUF("\"tecNO_ENTRY\""));
-                    else if (number == 133) append(APPENDNOINDENT, SBUF("\"tecNO_ISSUER\""));
-                    else if (number == 135) append(APPENDNOINDENT, SBUF("\"tecNO_LINE\""));
-                    else if (number == 126) append(APPENDNOINDENT, SBUF("\"tecNO_LINE_INSUF_RESERVE\""));
-                    else if (number == 127) append(APPENDNOINDENT, SBUF("\"tecNO_LINE_REDUNDANT\""));
-                    else if (number == 139) append(APPENDNOINDENT, SBUF("\"tecNO_PERMISSION\""));
-                    else if (number == 131) append(APPENDNOINDENT, SBUF("\"tecNO_REGULAR_KEY\""));
-                    else if (number == 138) append(APPENDNOINDENT, SBUF("\"tecNO_TARGET\""));
-                    else if (number == 145) append(APPENDNOINDENT, SBUF("\"tecOVERSIZE\""));
-                    else if (number == 132) append(APPENDNOINDENT, SBUF("\"tecOWNERS\""));
-                    else if (number == 128) append(APPENDNOINDENT, SBUF("\"tecPATH_DRY\""));
-                    else if (number == 101) append(APPENDNOINDENT, SBUF("\"tecPATH_PARTIAL\""));
-                    else if (number == 152) append(APPENDNOINDENT, SBUF("\"tecTOO_SOON\""));
-                    else if (number == 129) append(APPENDNOINDENT, SBUF("\"tecUNFUNDED\""));
-                    else if (number == 102) append(APPENDNOINDENT, SBUF("\"tecUNFUNDED_ADD\""));
-                    else if (number == 103) append(APPENDNOINDENT, SBUF("\"tecUNFUNDED_OFFER\""));
-                    else if (number == 104) append(APPENDNOINDENT, SBUF("\"tecUNFUNDED_PAYMENT\""));
-                    else if (number == 0) append(APPENDNOINDENT, SBUF("\"tesSUCCESS\""));
-                    else
-                        skip_print = 0;
-                }
-                else
-                    skip_print = 0;
-
-                if (skip_print)
-                    continue;
+                    name = xd_ter_name((int)number);      // TransactionResult
             }
-            char str[16];
-            int l = snprintf(str, 16, "%lu", number);
-            append(APPENDNOINDENT, str, l);
+
+            char str[128];
+            if (name)
+                snprintf(str, sizeof(str), "\"%s\"", name);
+            else if (is_signed)
+                snprintf(str, sizeof(str), "%lld", (long long)snumber);
+            else
+                snprintf(str, sizeof(str), "%llu", (unsigned long long)number);
+            APPENDS(APPENDNOINDENT, str);
         }
     }
 

@@ -1,5 +1,14 @@
 extern "C" {
 
+// Which network's field / transaction / ledger-entry / result tables the
+// deserializer uses. The wire format is shared, the tables are not.
+#define XD_NETWORK_XRPL  0
+#define XD_NETWORK_XAHAU 1
+extern int xd_network;
+
+// "XRP" or "XAH" depending on xd_network
+const char* xd_native_currency(void);
+
 extern bool (*b58_sha256_impl)(void *, const void *, size_t);
 int deserialize(
     uint8_t** output,
